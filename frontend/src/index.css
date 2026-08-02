@@ -1,0 +1,297 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ------------------------------------------------------------------ */
+/* Design Tokens - Obsidian & Pristine Light Mode                      */
+/* ------------------------------------------------------------------ */
+
+:root {
+  --sidebar-width: 280px;
+  --navbar-height: 64px;
+
+  /* Pristine Light Mode */
+  --border: #e2e8f0;
+  --border-hover: #10b981;
+  --surface: #f8fafc;
+  --surface-2: #ffffff;
+  --surface-3: #f1f5f9;
+  --surface-overlay: rgba(255, 255, 255, 0.88);
+
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+
+  --accent: #10b981;
+  --accent-hover: #059669;
+  --accent-light: #ecfdf5;
+  --accent-glow: rgba(16, 185, 129, 0.25);
+
+  --accent-blue: #3b82f6;
+  --accent-purple: #8b5cf6;
+
+  --scrollbar-thumb: #cbd5e1;
+}
+
+.dark {
+  /* Obsidian Dark Mode (ChatGPT / Claude / Perplexity / Manus feel) */
+  --border: #1e293b;
+  --border-hover: #10b981;
+  --surface: #0b0f17;         /* Deep obsidian background */
+  --surface-2: #111827;       /* Dark slate card surface */
+  --surface-3: #1f2937;       /* Elevating hover surface */
+  --surface-overlay: rgba(17, 24, 39, 0.90);
+
+  --text-primary: #f8fafc;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+
+  --accent: #10b981;
+  --accent-hover: #34d399;
+  --accent-light: rgba(16, 185, 129, 0.15);
+  --accent-glow: rgba(16, 185, 129, 0.35);
+
+  --accent-blue: #60a5fa;
+  --accent-purple: #a78bfa;
+
+  --scrollbar-thumb: #334155;
+}
+
+/* ------------------------------------------------------------------ */
+/* Core Reset & Typography                                             */
+/* ------------------------------------------------------------------ */
+*, *::before, *::after { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+
+body {
+  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  background: var(--surface);
+  color: var(--text-primary);
+  min-height: 100dvh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+  transition: background-color 0.25s ease, color 0.25s ease;
+}
+
+h1, h2, h3, h4, h5, h6, .font-display {
+  font-family: 'Plus Jakarta Sans', 'Inter', sans-serif;
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 99px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
+/* ------------------------------------------------------------------ */
+/* Animations & Keyframes                                             */
+/* ------------------------------------------------------------------ */
+@keyframes float {
+  0%, 100% { transform: translateY(0px) rotate(0deg); }
+  50% { transform: translateY(-12px) rotate(3deg); }
+}
+
+@keyframes pulseGlow {
+  0%, 100% { opacity: 0.4; transform: scale(1); }
+  50% { opacity: 0.85; transform: scale(1.06); }
+}
+
+@keyframes scannerLine {
+  0% { top: 0%; opacity: 0.8; }
+  50% { top: 95%; opacity: 1; }
+  100% { top: 0%; opacity: 0.8; }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.animate-float {
+  animation: float 6s ease-in-out infinite;
+}
+
+.animate-pulse-glow {
+  animation: pulseGlow 4s ease-in-out infinite;
+}
+
+.animate-scanner {
+  animation: scannerLine 2.2s ease-in-out infinite;
+}
+
+.animate-shimmer {
+  background: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 50%, var(--surface-2) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.8s infinite;
+}
+
+/* ------------------------------------------------------------------ */
+/* Glassmorphism & UI Component Utilities                             */
+/* ------------------------------------------------------------------ */
+@layer components {
+  .glass-panel {
+    background: var(--surface-2);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--border);
+  }
+
+  .glass-header {
+    background: var(--surface-overlay);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .card-modern {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 1.25rem;
+    transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .card-modern:hover {
+    border-color: var(--border-hover);
+    box-shadow: 0 12px 30px -8px var(--accent-glow);
+    transform: translateY(-2px);
+  }
+
+  .input-base {
+    @apply w-full text-sm outline-none resize-none;
+    background: transparent;
+    color: var(--text-primary);
+  }
+  .input-base::placeholder { color: var(--text-muted); }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2
+           px-4 py-2.5 rounded-xl text-sm font-semibold text-white
+           transition-all duration-200 shadow-sm cursor-pointer select-none;
+    background: var(--accent);
+  }
+  .btn-primary:hover {
+    background: var(--accent-hover);
+    box-shadow: 0 0 20px var(--accent-glow);
+  }
+  .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; box-shadow: none; }
+
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2
+           px-3 py-2 rounded-xl text-sm font-medium
+           transition-all duration-150 cursor-pointer select-none;
+    color: var(--text-secondary);
+  }
+  .btn-ghost:hover {
+    background: var(--surface-3);
+    color: var(--text-primary);
+  }
+
+  /* Chat bubble styling */
+  .msg-user {
+    @apply ml-auto max-w-[88%] sm:max-w-[78%] px-5 py-3.5 rounded-3xl rounded-tr-sm
+           text-sm leading-relaxed text-white shadow-md font-sans;
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+  }
+
+  .msg-ai {
+    @apply mr-auto max-w-[96%] sm:max-w-[90%] text-sm leading-relaxed;
+    color: var(--text-primary);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Markdown Formatting inside AI Responses                             */
+/* ------------------------------------------------------------------ */
+.prose-ai {
+  font-size: 0.935rem;
+  line-height: 1.75;
+  color: var(--text-primary);
+}
+.prose-ai h1, .prose-ai h2, .prose-ai h3 {
+  font-family: 'Plus Jakarta Sans', sans-serif;
+  font-weight: 700;
+  margin-top: 1.25rem;
+  margin-bottom: 0.6rem;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+.prose-ai h1 { font-size: 1.35rem; }
+.prose-ai h2 { font-size: 1.15rem; }
+.prose-ai h3 { font-size: 1.025rem; }
+
+.prose-ai p { margin-bottom: 0.85rem; }
+.prose-ai p:last-child { margin-bottom: 0; }
+.prose-ai ul, .prose-ai ol { padding-left: 1.35rem; margin-bottom: 0.85rem; }
+.prose-ai li { margin-bottom: 0.35rem; }
+.prose-ai strong { font-weight: 600; color: var(--text-primary); }
+.prose-ai em { font-style: italic; }
+
+.prose-ai table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.85rem;
+}
+.prose-ai th, .prose-ai td {
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+}
+.prose-ai th {
+  background: var(--surface-3);
+  font-weight: 700;
+}
+
+.prose-ai code {
+  font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 0.85em;
+  padding: 0.2em 0.45em;
+  border-radius: 6px;
+  background: var(--surface-3);
+  color: var(--accent);
+  border: 1px solid var(--border);
+}
+
+.prose-ai pre {
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 1rem;
+  overflow-x: auto;
+  margin-bottom: 0.85rem;
+  font-size: 0.85rem;
+}
+.prose-ai pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text-primary);
+}
+.prose-ai blockquote {
+  border-left: 3.5px solid var(--accent);
+  padding: 0.65rem 1rem;
+  color: var(--text-secondary);
+  font-style: italic;
+  margin-bottom: 0.85rem;
+  background: var(--surface-3);
+  border-radius: 0 12px 12px 0;
+}
+.prose-ai a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.prose-ai hr { border-color: var(--border); margin: 1.25rem 0; }
+
+/* Glowing effects */
+.glow-effect {
+  box-shadow: 0 0 25px var(--accent-glow);
+}
+.glow-effect-lg {
+  box-shadow: 0 0 45px var(--accent-glow);
+}
+.glow-text {
+  text-shadow: 0 0 20px var(--accent-glow);
+}
+

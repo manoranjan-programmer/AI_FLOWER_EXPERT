@@ -1,0 +1,43 @@
+# ============================================================
+# Flower AI Expert – Backend Dependencies
+# ============================================================
+# Install with:  pip install -r requirements.txt
+#
+# NOTE: llama-cpp-python requires a C++ compiler.
+#   Windows:  pip install llama-cpp-python --prefer-binary
+#   GPU:      CMAKE_ARGS="-DLLAMA_CUBLAS=on" pip install llama-cpp-python
+# ============================================================
+
+# --- Web framework -----------------------------------------------
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.17      # required for UploadFile support
+python-dotenv==1.0.1
+pydantic==2.10.3
+
+# --- Deep learning / AI ------------------------------------------
+tensorflow==2.18.0             # EfficientNet classifier
+numpy==1.26.4                  # pinned for TF compatibility
+Pillow==11.0.0                 # image preprocessing helper
+
+# --- FAISS + embeddings ------------------------------------------
+faiss-cpu==1.9.0               # swap for faiss-gpu on CUDA systems
+sentence-transformers==3.3.1   # all-MiniLM-L6-v2
+
+# --- LLM Backend (HuggingFace Transformers) -----------------------
+transformers==4.46.3
+accelerate==1.2.1
+torch==2.5.1                   # CPU wheel; replace with CUDA build for GPU
+
+# --- Translation (offline Helsinki-NLP Opus-MT) ------------------
+sentencepiece==0.2.0
+sacremoses==0.1.1              # required for MarianMT tokenizer
+
+# --- Utilities & MongoDB -----------------------------------------
+httpx==0.27.2                  # async HTTP (optional, future use)
+huggingface_hub>=0.20.0        # HuggingFace repository sync
+pymongo==4.17.0                # MongoDB retrieval driver
+pyjwt>=2.8.0                   # JWT token encoding & decoding
+google-auth>=2.27.0            # Google OAuth 2.0 token verification
+
+
