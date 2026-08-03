@@ -50,10 +50,12 @@ def preprocess_input(x: np.ndarray) -> np.ndarray:
 # ==========================================
 
 def _resolve_file_path(filename: str, hf_repo_id: str, models_dir: Path | None = None) -> Path:
-    """
-    Downloads filename from Hugging Face repository (HF_REPO_ID) using hf_hub_download(),
-    or falls back to local models_dir if download fails or HF_REPO_ID is not set.
-    """
+    """Check local file existence first. Download from Hugging Face repository only if missing."""
+    if models_dir is not None:
+        local_path = models_dir / filename
+        if local_path.exists():
+            return local_path
+
     if hf_repo_id:
         try:
             from huggingface_hub import hf_hub_download
@@ -65,11 +67,6 @@ def _resolve_file_path(filename: str, hf_repo_id: str, models_dir: Path | None =
             return Path(downloaded)
         except Exception as exc:
             logger.warning("Hugging Face download failed for '%s' from repo '%s': %s", filename, hf_repo_id, exc)
-
-    if models_dir is not None:
-        local_path = models_dir / filename
-        if local_path.exists():
-            return local_path
 
     return Path(filename)
 
@@ -205,9 +202,11 @@ def load(models_dir: Path | None = None):
     logger.info("Loading ONNX Classifier model '%s' into memory...", model_path.name)
 
     opts = ort.SessionOptions()
-    opts.intra_op_num_threads = os.cpu_count() or 4
+    opts.intra_op_num_threads = max(1, min(4, (os.cpu_count() or 4) - 1 if (os.cpu_count() or 4) > 2 else 2))
+    opts.inter_op_num_threads = 1
     opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.log_severity_level = 3
 
     _session = ort.InferenceSession(
         str(model_path),
@@ -263,7 +262,7 @@ def get_model_name() -> str:
 import threading
 
 _classifier_lock = threading.Lock()
-_models_dir: Path | None = None
+_models_dir: Path | None = Path(__file__).parent / "models"
 
 
 def get_classifier():

@@ -120,8 +120,8 @@ def get_llm():
                 logger.info("  Active Backend : transformers")
                 logger.info("  Model Name     : %s", PHI_HF_MODEL)
 
-                cpu_count = os.cpu_count() or 4
-                torch.set_num_threads(cpu_count)
+                num_threads = max(1, min(4, (os.cpu_count() or 4) - 1 if (os.cpu_count() or 4) > 2 else 2))
+                torch.set_num_threads(num_threads)
 
                 logger.info("Loading tokenizer for '%s'...", PHI_HF_MODEL)
                 _tokenizer = AutoTokenizer.from_pretrained(
@@ -769,8 +769,7 @@ async def generate_async(
     if fast:
         return fast
 
-    if not _backend or _model is None:
-        raise RuntimeError("Chatbot not loaded. Call load() first.")
+    get_llm()
 
     loop = asyncio.get_event_loop()
 
@@ -892,11 +891,13 @@ def generate_stream(
     )
     inputs = _tokenizer(prompt, return_tensors="pt").to(_model.device)
 
+    from queue import Empty
+
     streamer = TextIteratorStreamer(
         _tokenizer,
         skip_prompt=True,
         skip_special_tokens=True,
-        timeout=30.0,
+        timeout=120.0,
     )
 
     use_sampling = PHI_TEMPERATURE > 0.35
@@ -916,6 +917,8 @@ def generate_stream(
 
     def _worker():
         import torch
+        num_threads = max(1, min(4, (os.cpu_count() or 4) - 1 if (os.cpu_count() or 4) > 2 else 2))
+        torch.set_num_threads(num_threads)
         with torch.inference_mode():
             _model.generate(**gen_kwargs)
 
@@ -923,12 +926,15 @@ def generate_stream(
     thread.start()
 
     collected_tokens = []
-    for token in streamer:
-        if token:
-            collected_tokens.append(token)
-            yield token
+    try:
+        for token in streamer:
+            if token:
+                collected_tokens.append(token)
+                yield token
+    except Empty:
+        logger.warning("TextIteratorStreamer timeout after 120s; returning collected tokens.")
 
-    thread.join(timeout=30)
+    thread.join(timeout=120)
 
     # Cache response for identical queries
     if collected_tokens:
@@ -951,8 +957,7 @@ async def generate_stream_async(
     Asynchronous generator yielding tokens in real-time over an asyncio.Queue,
     running the token-generator thread safely inside worker threads.
     """
-    if not _backend or _model is None:
-        raise RuntimeError("Chatbot not loaded. Call load() first.")
+    get_llm()
 
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
