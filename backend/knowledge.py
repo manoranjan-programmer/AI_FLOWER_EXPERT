@@ -57,6 +57,8 @@ _faiss_lock = threading.Lock()
 _embedding_lock = threading.Lock()
 _docs_lock = threading.Lock()
 _lookup_lock = threading.Lock()
+_kb_lock = threading.Lock()          # orchestrated knowledge-base lock
+_kb_ready = False                    # True once all three resources confirmed loaded
 
 
 def normalize_flower_name(name: str) -> str:
@@ -66,67 +68,136 @@ def normalize_flower_name(name: str) -> str:
     return name.strip().lower().replace("-", "").replace(" ", "").replace("_", "")
 
 
-def get_faiss_index():
-    """Lazy-load FAISS index thread-safely."""
-    global _faiss_index
-    if _faiss_index is None:
-        with _faiss_lock:
-            if _faiss_index is None:
-                import faiss
-                index_path = _models_dir / "flower_faiss.index"
-                if index_path.exists():
-                    _faiss_index = faiss.read_index(str(index_path))
-                    logger.info("FAISS Loaded")
-    return _faiss_index
-
-
-def get_embedding_model():
-    """Lazy-load SentenceTransformer embedding model thread-safely."""
-    global _embed_model
-    if _embed_model is None:
-        with _embedding_lock:
-            if _embed_model is None:
-                from sentence_transformers import SentenceTransformer
-                model_name = "BAAI/bge-small-en-v1.5"
-                _embed_model = SentenceTransformer(model_name)
-                logger.info("Embedding Loaded")
-    return _embed_model
-
+# ---------------------------------------------------------------------------
+# Individual lazy getters (load once, cache forever, log once)
+# ---------------------------------------------------------------------------
 
 def get_flower_documents() -> list[str]:
-    """Lazy-load flower documents JSON thread-safely."""
+    """Lazy-load flower_documents.json thread-safely. Logs once on first load."""
     global _documents, _flower_docs_by_norm_name
-    if not _documents:
-        with _docs_lock:
-            if not _documents:
-                docs_path = _models_dir / "flower_documents.json"
-                if docs_path.exists():
-                    with open(docs_path, "r", encoding="utf-8") as f:
-                        _documents = json.load(f)
-                    for doc in _documents:
-                        m = re.search(r"Flower\s*Name:\s*([^\n]+)", doc, re.IGNORECASE)
-                        if m:
-                            raw_name = m.group(1).strip()
-                            _flower_docs_by_norm_name[normalize_flower_name(raw_name)] = doc
-                    logger.info("Flower Documents Loaded")
+    if _documents:
+        return _documents
+    with _docs_lock:
+        if _documents:
+            return _documents
+        docs_path = _models_dir / "flower_documents.json"
+        if not docs_path.exists():
+            logger.error("flower_documents.json not found at %s", docs_path)
+            return _documents
+        logger.info("Loading Flower Documents...")
+        with open(docs_path, "r", encoding="utf-8") as f:
+            _documents = json.load(f)
+        for doc in _documents:
+            m = re.search(r"Flower\s*Name:\s*([^\n]+)", doc, re.IGNORECASE)
+            if m:
+                raw_name = m.group(1).strip()
+                _flower_docs_by_norm_name[normalize_flower_name(raw_name)] = doc
+        logger.info("Flower Documents Loaded (%d documents)", len(_documents))
     return _documents
 
 
+def get_embedding_model():
+    """Lazy-load SentenceTransformer embedding model thread-safely. Logs once."""
+    global _embed_model
+    if _embed_model is not None:
+        return _embed_model
+    with _embedding_lock:
+        if _embed_model is not None:
+            return _embed_model
+        logger.info("Loading Embeddings...")
+        from sentence_transformers import SentenceTransformer
+        model_name = "BAAI/bge-small-en-v1.5"
+        _embed_model = SentenceTransformer(model_name)
+        logger.info("Embeddings Loaded")
+    return _embed_model
+
+
+def get_faiss_index():
+    """Lazy-load FAISS index thread-safely. Logs once."""
+    global _faiss_index
+    if _faiss_index is not None:
+        return _faiss_index
+    with _faiss_lock:
+        if _faiss_index is not None:
+            return _faiss_index
+        index_path = _models_dir / "flower_faiss.index"
+        if not index_path.exists():
+            logger.error("flower_faiss.index not found at %s", index_path)
+            return None
+        logger.info("Loading FAISS...")
+        import faiss
+        _faiss_index = faiss.read_index(str(index_path))
+        logger.info("FAISS Loaded")
+    return _faiss_index
+
+
 def get_flower_lookup() -> dict[str, dict]:
-    """Lazy-load flower lookup JSON thread-safely."""
+    """Lazy-load flower_lookup.json thread-safely."""
     global _flower_lookup, _norm_flower_map
-    if not _flower_lookup:
-        with _lookup_lock:
-            if not _flower_lookup:
-                lookup_path = _models_dir / "flower_lookup.json"
-                if lookup_path.exists():
-                    with open(lookup_path, "r", encoding="utf-8") as f:
-                        _flower_lookup = json.load(f)
-                    _norm_flower_map = {
-                        name.lower(): name
-                        for name in _flower_lookup.keys()
-                    }
+    if _flower_lookup:
+        return _flower_lookup
+    with _lookup_lock:
+        if _flower_lookup:
+            return _flower_lookup
+        lookup_path = _models_dir / "flower_lookup.json"
+        if lookup_path.exists():
+            with open(lookup_path, "r", encoding="utf-8") as f:
+                _flower_lookup = json.load(f)
+            _norm_flower_map = {
+                name.lower(): name
+                for name in _flower_lookup.keys()
+            }
     return _flower_lookup
+
+
+# ---------------------------------------------------------------------------
+# Orchestrated dependency-aware knowledge base initialiser
+# ---------------------------------------------------------------------------
+
+def get_knowledge_base() -> tuple:
+    """
+    Dependency-aware lazy initialiser for the full knowledge stack.
+
+    Load order (strict dependency chain):
+      1. Flower Documents  – needed for context
+      2. Embedding Model   – needed for FAISS queries
+      3. FAISS Index       – needs embeddings to be ready first
+
+    Returns (documents, embed_model, faiss_index).
+    Raises RuntimeError with a clear message if any component failed to load.
+    Logs each resource exactly ONCE. Subsequent calls return cached objects immediately.
+    """
+    global _kb_ready
+    if _kb_ready:
+        return _documents, _embed_model, _faiss_index
+
+    with _kb_lock:
+        if _kb_ready:
+            return _documents, _embed_model, _faiss_index
+
+        docs = get_flower_documents()
+        embed = get_embedding_model()
+        faiss_idx = get_faiss_index()
+
+        missing = []
+        if not docs:
+            missing.append("Flower Documents")
+        if embed is None:
+            missing.append("Embedding Model")
+        if faiss_idx is None:
+            missing.append("FAISS Index")
+
+        if missing:
+            raise RuntimeError(
+                f"Knowledge base failed to load: {', '.join(missing)}. "
+                "Ensure flower_documents.json, flower_faiss.index, and "
+                "BAAI/bge-small-en-v1.5 are available."
+            )
+
+        _kb_ready = True
+        logger.info("Knowledge Base Ready")
+
+    return _documents, _embed_model, _faiss_index
 
 
 def load(models_dir: Path) -> None:
@@ -306,12 +377,12 @@ def build_flower_context(flower_info: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _search_cached(query: str, k: int) -> tuple[str, ...]:
-    faiss_index = get_faiss_index()
-    embed_model = get_embedding_model()
-    docs = get_flower_documents()
-
-    if faiss_index is None or embed_model is None:
-        raise RuntimeError("Knowledge base has not been loaded yet.")
+    """
+    Execute FAISS vector search against the full knowledge stack.
+    Always calls get_knowledge_base() to ensure documents, embeddings, and FAISS
+    are fully loaded before searching. Raises RuntimeError (→ HTTP 503) if unavailable.
+    """
+    docs, embed_model, faiss_index = get_knowledge_base()
 
     if not query:
         return ()
@@ -334,7 +405,6 @@ def _search_cached(query: str, k: int) -> tuple[str, ...]:
             parsed = parse_flower_doc(doc)
             flower_id = (parsed.get("Flower Name") or parsed.get("Scientific Name") or "").strip().lower()
             if not flower_id:
-                # Fallback extraction if parse_flower_doc doesn't match standard header
                 m = re.search(r"Flower\s*Name:\s*([^\n]+)", doc, re.IGNORECASE)
                 flower_id = m.group(1).strip().lower() if m else doc[:40].strip().lower()
 

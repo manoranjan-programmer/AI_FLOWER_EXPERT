@@ -340,9 +340,18 @@ async def chat(
             context_docs = await asyncio.get_event_loop().run_in_executor(
                 None, knowledge.search, user_message, search_k
             )
+        except RuntimeError as exc:
+            logger.error("Knowledge base unavailable for /chat: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail="Knowledge base unavailable. Please try again in a moment.",
+            )
         except Exception as exc:
-            logger.warning("FAISS search failed: %s", exc)
-            context_docs = [conversation_manager.current_summary or ""]
+            logger.error("FAISS search failed unexpectedly: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail="Knowledge base unavailable. Please try again in a moment.",
+            )
 
     retrieval_time = time.perf_counter() - start_time
     logger.info("Knowledge retrieval time: %.3fs", retrieval_time)
@@ -458,9 +467,18 @@ async def chat_stream(
             context_docs = await asyncio.get_event_loop().run_in_executor(
                 None, knowledge.search, user_message, search_k
             )
+        except RuntimeError as exc:
+            logger.error("Knowledge base unavailable for /chat/stream: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail="Knowledge base unavailable. Please try again in a moment.",
+            )
         except Exception as exc:
-            logger.warning("FAISS search failed: %s", exc)
-            context_docs = [conversation_manager.current_summary or ""]
+            logger.error("FAISS search failed unexpectedly: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail="Knowledge base unavailable. Please try again in a moment.",
+            )
 
     history = conversation_manager.get_history_as_dicts()
     conversation_manager.add_user_message(user_message)
