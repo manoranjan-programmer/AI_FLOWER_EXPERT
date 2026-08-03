@@ -11,7 +11,7 @@ import {
   useReducer,
   useRef,
 } from 'react'
-import { predictFlower, sendChatMessage, streamChatMessage, fetchHistory, saveHistorySession, submitFeedbackApi } from '../api/flowerApi'
+import { predictFlower, sendChatMessage, streamChatMessage, fetchHistory, saveHistorySession, submitFeedbackApi, selectFlowerApi } from '../api/flowerApi'
 import AuthContext from './AuthContext'
 
 const loadFavorites = () => {
@@ -769,6 +769,16 @@ export function AppProvider({ children }) {
   const loadSession = useCallback((sessionItem) => {
     if (!sessionItem) return
     dispatch({ type: 'LOAD_SESSION', payload: sessionItem })
+
+    if (sessionItem.flower && sessionItem.flower !== 'AI Botanical Chat' && sessionItem.flower !== 'General AI Chat') {
+      selectFlowerApi(
+        sessionItem.flower,
+        sessionItem.confidence || 98.5,
+        sessionItem.filename || '',
+        sessionItem.imagePreview || sessionItem.image_preview || ''
+      )
+    }
+
     showToast(`Loaded conversation for ${sessionItem.flower || 'plant'} 🌸`, 'info')
   }, [showToast])
 

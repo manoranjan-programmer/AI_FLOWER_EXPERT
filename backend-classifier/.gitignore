@@ -1,0 +1,6 @@
+.env
+venv1
+__pycache__
+hf_cache
+models
+.cache

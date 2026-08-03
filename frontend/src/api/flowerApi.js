@@ -1,86 +1,87 @@
 /**
  * flowerApi.js
- * Centralised Axios-based API client for Flower AI Expert.
- * All backend calls go through this module.
+ * Dual-endpoint Axios API client for Flower AI Expert.
+ * Routes image classification calls to backend-classifier and chatbot/auth/history calls to backend-chatbot.
  */
 
 import axios from 'axios'
 
-// In development mode (Vite dev server), use relative path '' so requests are same-origin
-// and proxied by Vite to the backend URL in .env. This prevents Chrome cross-origin stream buffering.
 const isDev = import.meta.env.DEV
-const rawBaseUrl = import.meta.env.VITE_API_BASE_URL ?? ''
-const BASE_URL = isDev ? '' : rawBaseUrl.replace(/\/+$/, '')
 
-const api = axios.create({
-  baseURL: BASE_URL,
+const rawChatbotUrl = import.meta.env.VITE_CHATBOT_API || import.meta.env.VITE_BACKEND_URL || import.meta.env.VITE_API_BASE_URL || ''
+const rawClassifierUrl = import.meta.env.VITE_CLASSIFIER_API || ''
+
+const CHATBOT_BASE_URL = isDev ? '' : rawChatbotUrl.replace(/\/+$/, '')
+const CLASSIFIER_BASE_URL = isDev ? '' : rawClassifierUrl.replace(/\/+$/, '')
+
+const chatbotApi = axios.create({
+  baseURL: CHATBOT_BASE_URL,
   timeout: 120_000,   // 2 min – LLM generation can be slow on CPU
   withCredentials: true,
   headers: { 'Content-Type': 'application/json' },
 })
 
-// --------------------------------------------------------------------------
-// Request / response interceptors
-// --------------------------------------------------------------------------
-api.interceptors.response.use(
-  (response) => response,
-  (error) => {
-    const message =
-      error.response?.data?.detail ||
-      error.response?.data?.message ||
-      error.message ||
-      'An unexpected error occurred.'
-    return Promise.reject(new Error(message))
-  },
-)
+const classifierApi = axios.create({
+  baseURL: CLASSIFIER_BASE_URL,
+  timeout: 60_000,
+  withCredentials: true,
+})
+
+// Response interceptors
+const handleResponseError = (error) => {
+  const message =
+    error.response?.data?.detail ||
+    error.response?.data?.message ||
+    error.message ||
+    'An unexpected error occurred.'
+  return Promise.reject(new Error(message))
+}
+
+chatbotApi.interceptors.response.use((res) => res, handleResponseError)
+classifierApi.interceptors.response.use((res) => res, handleResponseError)
 
 // --------------------------------------------------------------------------
-// Auth API methods
+// Auth API methods (Chatbot microservice)
 // --------------------------------------------------------------------------
 
-/**
- * Authenticate with Google OAuth 2.0 credential string (ID Token).
- * @param {string} credential
- * @returns {Promise<{ status: string, token: string, user: object }>}
- */
 export async function loginWithGoogleApi(credential) {
-  const response = await api.post('/auth/google', { credential })
+  const response = await chatbotApi.post('/auth/google', { credential })
   return response.data
 }
 
-/**
- * Fetch current authenticated user profile.
- * @returns {Promise<{ status: string, user: object }>}
- */
 export async function fetchCurrentUserApi() {
-  const response = await api.get('/auth/me')
+  const response = await chatbotApi.get('/auth/me')
   return response.data
 }
 
-/**
- * Logout current user session and clear cookies.
- * @returns {Promise<{ status: string, message: string }>}
- */
 export async function logoutApi() {
-  const response = await api.post('/auth/logout')
+  const response = await chatbotApi.post('/auth/logout')
   return response.data
 }
 
-// --------------------------------------------------------------------------
-// AI & Application API methods
-// --------------------------------------------------------------------------
+function readFileAsDataUrl(file) {
+  return new Promise((resolve) => {
+    if (!file) return resolve('')
+    const reader = new FileReader()
+    reader.onload = (e) => resolve(e.target?.result || '')
+    reader.onerror = () => resolve('')
+    reader.readAsDataURL(file)
+  })
+}
 
 /**
- * Upload a flower image for classification.
+ * Upload a flower image for classification to backend-classifier (port 8001),
+ * then notify backend-chatbot (port 8000) to set active context, save image preview, and fetch summary/card.
  * @param {File} imageFile
- * @param {function} onUploadProgress  – optional progress callback (pct: number)
- * @returns {Promise<{ flower, confidence, summary, card }>}
+ * @param {function} onUploadProgress – optional progress callback (pct: number)
+ * @returns {Promise<{ session_id, flower, confidence, summary, card }>}
  */
 export async function predictFlower(imageFile, onUploadProgress) {
   const formData = new FormData()
   formData.append('file', imageFile)
 
-  const response = await api.post('/predict', formData, {
+  // Step 1: Send image to Classifier service (port 8001)
+  const classifierResponse = await classifierApi.post('/predict', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
     onUploadProgress: onUploadProgress
       ? (evt) => {
@@ -89,45 +90,97 @@ export async function predictFlower(imageFile, onUploadProgress) {
         }
       : undefined,
   })
-  return response.data
+
+  const { flower_name, flower, confidence, session_id } = classifierResponse.data
+  const predictedFlower = flower_name || flower || 'Unknown'
+
+  // Step 2: Read base64 image preview for MongoDB history persistence
+  const imagePreview = await readFileAsDataUrl(imageFile)
+  const filename = imageFile?.name || 'flower.jpg'
+
+  // Step 3: Notify Chatbot service (port 8000) to initialize active flower context, image preview, & card
+  try {
+    const selectResponse = await chatbotApi.post('/flower/select', {
+      flower_name: predictedFlower,
+      confidence: confidence,
+      filename: filename,
+      image_preview: imagePreview,
+    })
+    return selectResponse.data
+  } catch (err) {
+    console.warn('Chatbot service context sync fallback:', err)
+    const normalizedFlower = (predictedFlower || 'flower').toLowerCase().replace(/ /g, '_')
+    return {
+      session_id: session_id || `session_${normalizedFlower}_${Date.now()}`,
+      flower: predictedFlower,
+      confidence: confidence || 98.5,
+      summary: `Identified as ${predictedFlower}`,
+      card: { flower_name: predictedFlower },
+    }
+  }
 }
 
 /**
- * Send a chat message about the current flower.
+ * Explicitly set active flower context on backend-chatbot (port 8000).
+ */
+export async function selectFlowerApi(flowerName, confidence = 98.5, filename = '', imagePreview = '') {
+  try {
+    const response = await chatbotApi.post('/flower/select', {
+      flower_name: flowerName,
+      confidence: confidence,
+      filename: filename,
+      image_preview: imagePreview,
+    })
+    return response.data
+  } catch (err) {
+    console.warn('selectFlowerApi error:', err)
+    return null
+  }
+}
+
+/**
+ * Send a chat message about the current flower to backend-chatbot (port 8000).
  * @param {string} message
  * @returns {Promise<{ answer: string }>}
  */
 export async function sendChatMessage(message) {
-  const response = await api.post('/chat', { message })
+  const response = await chatbotApi.post('/chat', { message })
   return response.data
 }
 
 /**
  * Send a chat message with real-time ChatGPT-style token streaming.
- * @param {string} message
- * @param {function(string): void} onToken
- * @param {function(Error): void} onError
- * @param {function(): void} onDone
  */
 export async function streamChatMessage(message, onToken, onError, onDone) {
   try {
-    const directHost = import.meta.env.VITE_BACKEND_URL || import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000'
-    const url = `${directHost.replace(/\/+$/, '')}/chat/stream`
-    const response = await fetch(url, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message }),
-    })
+    const rawHost = import.meta.env.VITE_CHATBOT_API || import.meta.env.VITE_BACKEND_URL || import.meta.env.VITE_API_BASE_URL || ''
+    const baseUrl = isDev ? '' : rawHost.replace(/\/+$/, '')
+    const url = `${baseUrl}/chat/stream`
+
+    let response
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message }),
+      })
+    } catch (netErr) {
+      throw new Error('Could not connect to Chatbot Service on port 8000. Please ensure backend-chatbot is running on port 8000.')
+    }
 
     if (!response.ok) {
       const errText = await response.text()
       let errMsg = 'Failed to connect to streaming response.'
-      try {
-        const parsed = JSON.parse(errText)
-        errMsg = parsed.detail || parsed.message || errMsg
-      } catch (e) {
-        if (errText) errMsg = errText
+      if (response.status === 502 || response.status === 504) {
+        errMsg = 'Chatbot Service is offline on port 8000. Please start backend-chatbot with: uvicorn app:app --port 8000'
+      } else {
+        try {
+          const parsed = JSON.parse(errText)
+          errMsg = parsed.detail || parsed.message || errMsg
+        } catch (e) {
+          if (errText) errMsg = errText
+        }
       }
       throw new Error(errMsg)
     }
@@ -147,7 +200,6 @@ export async function streamChatMessage(message, onToken, onError, onDone) {
       for (const line of lines) {
         const trimmed = line.trim()
         if (!trimmed || trimmed.startsWith(':')) {
-          // Ignore empty lines or SSE comment lines (like : ping)
           continue
         }
         if (trimmed.startsWith('data: ')) {
@@ -165,7 +217,6 @@ export async function streamChatMessage(message, onToken, onError, onDone) {
               onToken(parsed.token)
             }
           } catch (e) {
-            // handle error
             if (e.message && e.message !== 'Unexpected token' && onError) {
               onError(e)
             }
@@ -182,21 +233,17 @@ export async function streamChatMessage(message, onToken, onError, onDone) {
 
 /**
  * Translate text to a target language offline.
- * @param {string} text
- * @param {string} language  – ISO 639-1 code: "ta" | "hi" | "ml" | "en"
- * @returns {Promise<{ translated: string, language: string }>}
  */
 export async function translateText(text, language) {
-  const response = await api.post('/translate', { text, language })
+  const response = await chatbotApi.post('/translate', { text, language })
   return response.data
 }
 
 /**
  * Health check.
- * @returns {Promise<{ status: string, flower: string|null }>}
  */
 export async function healthCheck() {
-  const response = await api.get('/health')
+  const response = await chatbotApi.get('/health')
   return response.data
 }
 
@@ -204,7 +251,7 @@ export async function healthCheck() {
  * Fetch search history records from MongoDB Atlas.
  */
 export async function fetchHistory() {
-  const response = await api.get('/history')
+  const response = await chatbotApi.get('/history')
   return response.data
 }
 
@@ -212,18 +259,16 @@ export async function fetchHistory() {
  * Save chat session history to MongoDB Atlas.
  */
 export async function saveHistorySession(sessionData) {
-  const response = await api.post('/history/save', sessionData)
+  const response = await chatbotApi.post('/history/save', sessionData)
   return response.data
 }
 
 /**
- * Submit structured user feedback (Like/Dislike, Star Rating, Reasons, Comments) to MongoDB Chatbot_Feedback.
- * @param {object} feedbackData
- * @returns {Promise<{ status: string, feedback_id: string, message: string }>}
+ * Submit structured user feedback.
  */
 export async function submitFeedbackApi(feedbackData) {
-  const response = await api.post('/api/analytics/feedback', feedbackData)
+  const response = await chatbotApi.post('/api/analytics/feedback', feedbackData)
   return response.data
 }
 
-export default api
+export default chatbotApi

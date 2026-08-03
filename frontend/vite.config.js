@@ -3,17 +3,21 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
-  const target = env.VITE_BACKEND_URL || env.VITE_API_BASE_URL || 'http://localhost:8000'
+  const chatbotTarget = env.VITE_CHATBOT_API || env.VITE_BACKEND_URL || env.VITE_API_BASE_URL || 'http://localhost:8000'
+  const classifierTarget = env.VITE_CLASSIFIER_API || 'http://localhost:8001'
 
   return {
     plugins: [react()],
     server: {
       port: 5173,
       proxy: {
-        // Proxy API calls to FastAPI backend configured via .env
-        '/auth': { target, changeOrigin: true },
+        // Classifier microservice proxy
+        '/predict': { target: classifierTarget, changeOrigin: true },
+
+        // Chatbot microservice proxy
+        '/auth': { target: chatbotTarget, changeOrigin: true },
         '/chat/stream': {
-          target,
+          target: chatbotTarget,
           changeOrigin: true,
           ws: true,
           configure: (proxy) => {
@@ -23,16 +27,12 @@ export default defineConfig(({ mode }) => {
             })
           },
         },
-        '/predict': { target, changeOrigin: true },
-        '/chat': { target, changeOrigin: true },
-        '/translate': { target, changeOrigin: true },
-        '/health': { target, changeOrigin: true },
-        '/history': { target, changeOrigin: true },
-        '/api': { target, changeOrigin: true },
-        '^/flower($|\\?)': {
-          target: target,
-          changeOrigin: true,
-        },
+        '/chat': { target: chatbotTarget, changeOrigin: true },
+        '/translate': { target: chatbotTarget, changeOrigin: true },
+        '/health': { target: chatbotTarget, changeOrigin: true },
+        '/history': { target: chatbotTarget, changeOrigin: true },
+        '/api': { target: chatbotTarget, changeOrigin: true },
+        '/flower': { target: chatbotTarget, changeOrigin: true },
       },
     },
   }
