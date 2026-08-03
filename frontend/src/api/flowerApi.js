@@ -40,12 +40,27 @@ const handleResponseError = (error) => {
 chatbotApi.interceptors.response.use((res) => res, handleResponseError)
 classifierApi.interceptors.response.use((res) => res, handleResponseError)
 
+// Attach stored JWT token as Authorization Bearer header on every chatbot request
+// This is the fallback for production where cross-origin cookies may be blocked
+chatbotApi.interceptors.request.use((config) => {
+  const token = localStorage.getItem('flower_ai_token')
+  if (token) {
+    config.headers = config.headers || {}
+    config.headers['Authorization'] = `Bearer ${token}`
+  }
+  return config
+})
+
 // --------------------------------------------------------------------------
 // Auth API methods (Chatbot microservice)
 // --------------------------------------------------------------------------
 
 export async function loginWithGoogleApi(credential) {
   const response = await chatbotApi.post('/auth/google', { credential })
+  // Store JWT token for Bearer header fallback (production cross-origin deployments)
+  if (response.data?.token) {
+    localStorage.setItem('flower_ai_token', response.data.token)
+  }
   return response.data
 }
 
@@ -56,6 +71,8 @@ export async function fetchCurrentUserApi() {
 
 export async function logoutApi() {
   const response = await chatbotApi.post('/auth/logout')
+  // Clear stored token on logout
+  localStorage.removeItem('flower_ai_token')
   return response.data
 }
 
@@ -159,10 +176,15 @@ export async function streamChatMessage(message, onToken, onError, onDone) {
 
     let response
     try {
+      const streamHeaders = { 'Content-Type': 'application/json' }
+      const storedToken = localStorage.getItem('flower_ai_token')
+      if (storedToken) {
+        streamHeaders['Authorization'] = `Bearer ${storedToken}`
+      }
       response = await fetch(url, {
         method: 'POST',
         credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
+        headers: streamHeaders,
         body: JSON.stringify({ message }),
       })
     } catch (netErr) {

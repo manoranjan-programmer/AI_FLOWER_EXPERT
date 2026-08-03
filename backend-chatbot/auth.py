@@ -231,13 +231,23 @@ async def google_login(payload: GoogleAuthRequest, response: Response, request: 
     access_token = create_access_token(jwt_claims)
 
     # Set HTTP-only Cookie
+    # Detect HTTPS/production: secure=True + samesite=none required for cross-origin cookies
+    is_https = (
+        os.getenv("HTTPS", "").lower() in ("true", "1", "yes")
+        or os.getenv("RENDER", "") != ""
+        or os.getenv("RAILWAY_ENVIRONMENT", "") != ""
+        or os.getenv("KOYEB_APP_NAME", "") != ""
+        or request.headers.get("x-forwarded-proto", "").lower() == "https"
+    )
+    cookie_secure = is_https
+    cookie_samesite = "none" if is_https else "lax"
     response.set_cookie(
         key="access_token",
         value=access_token,
         httponly=True,
         max_age=JWT_EXPIRE_DAYS * 86400,
-        samesite="lax",
-        secure=False,  # Allowed for local HTTP dev; set to True in production HTTPS
+        samesite=cookie_samesite,
+        secure=cookie_secure,
     )
 
     # Asynchronously log user login activity after response is sent
@@ -271,9 +281,21 @@ async def get_me(request: Request):
 
 
 @router.post("/logout")
-async def logout(response: Response):
+async def logout(request: Request, response: Response):
     """Logs out user by clearing access_token HTTP-only cookie."""
-    response.delete_cookie(key="access_token", httponly=True, samesite="lax")
+    is_https = (
+        os.getenv("HTTPS", "").lower() in ("true", "1", "yes")
+        or os.getenv("RENDER", "") != ""
+        or os.getenv("RAILWAY_ENVIRONMENT", "") != ""
+        or os.getenv("KOYEB_APP_NAME", "") != ""
+        or request.headers.get("x-forwarded-proto", "").lower() == "https"
+    )
+    response.delete_cookie(
+        key="access_token",
+        httponly=True,
+        samesite="none" if is_https else "lax",
+        secure=is_https,
+    )
     return {"status": "ok", "message": "Logged out successfully."}
 
 
