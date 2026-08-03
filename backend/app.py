@@ -151,33 +151,10 @@ def download_models(models_dir: Path) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    t0 = time.perf_counter()
-    logger.info("=== Flower AI Expert – starting up ===")
-
-    loop = asyncio.get_event_loop()
-
-    # ── Step 1: Ensure missing models are downloaded from HF Repo ─────────────
-    logger.info("Checking Hugging Face repository for missing models …")
-    await loop.run_in_executor(None, download_models, MODELS_DIR)
-
-    # Pre-import transformers to prevent thread import race condition
-    import transformers
-
-    logger.info("Loading all models in parallel …")
-    await asyncio.gather(
-        loop.run_in_executor(None, classifier.load, MODELS_DIR),
-        loop.run_in_executor(None, knowledge.load,  MODELS_DIR),
-        loop.run_in_executor(None, chatbot.load),
-        loop.run_in_executor(None, translation.preload),
-    )
-
-    elapsed = time.perf_counter() - t0
-    logger.info("=== All models ready in %.1f s. Active Classifier: '%s'. Accepting requests. ===", elapsed, classifier.get_model_name())
-
+    logger.info("Backend Started")
+    knowledge.load(MODELS_DIR)
     yield
-
     logger.info("=== Flower AI Expert – shutdown ===")
-    chatbot.unload()
 
 
 # ---------------------------------------------------------------------------

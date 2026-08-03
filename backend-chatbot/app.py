@@ -67,28 +67,10 @@ MODELS_DIR = BASE_DIR / "models"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    t0 = time.perf_counter()
-    logger.info("=== Flower AI Chatbot Service – starting up ===")
-
-    loop = asyncio.get_event_loop()
-
-    # Pre-import transformers to prevent thread import race condition
-    import transformers
-
-    logger.info("Loading models in parallel …")
-    await asyncio.gather(
-        loop.run_in_executor(None, knowledge.load, MODELS_DIR),
-        loop.run_in_executor(None, chatbot.load),
-        loop.run_in_executor(None, translation.preload),
-    )
-
-    elapsed = time.perf_counter() - t0
-    logger.info("=== Chatbot service ready in %.1fs. Accepting requests. ===", elapsed)
-
+    logger.info("Backend Started")
+    knowledge.load(MODELS_DIR)
     yield
-
     logger.info("=== Chatbot Service – shutdown ===")
-    chatbot.unload()
 
 
 # ---------------------------------------------------------------------------

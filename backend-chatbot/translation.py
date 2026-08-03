@@ -45,44 +45,58 @@ LANGUAGE_PREFIXES: dict[str, str] = {
     "kn": ">>kan<<",   # Kannada
 }
 
+import threading
+
 # Cache loaded pipelines: lang_code -> transformers pipeline
 _pipelines: dict[str, object] = {}
+_translation_lock = threading.Lock()
+_translation_loaded_logged = False
+
+
+def get_translation_pipeline(lang_code: str):
+    """Lazy-load the translation pipeline for a given language code (thread-safe)."""
+    global _pipelines, _translation_loaded_logged
+    lang = lang_code.lower().strip() if lang_code else ""
+    if lang == "en" or not lang:
+        return None
+
+    if lang in _pipelines:
+        return _pipelines[lang]
+
+    with _translation_lock:
+        if lang in _pipelines:
+            return _pipelines[lang]
+
+        import torch
+        from transformers import pipeline as hf_pipeline
+
+        model_id = LANGUAGE_MODELS.get(lang)
+        if not model_id:
+            return None
+
+        logger.info("Loading translation model '%s' for lang='%s' …", model_id, lang)
+        device = 0 if torch.cuda.is_available() else -1
+        pipe = hf_pipeline(
+            "translation",
+            model=model_id,
+            tokenizer=model_id,
+            framework="pt",
+            device=device,
+        )
+        _pipelines[lang] = pipe
+        if not _translation_loaded_logged:
+            logger.info("Translation Loaded")
+            _translation_loaded_logged = True
+        return pipe
 
 
 def _get_pipeline(lang_code: str):
-    """Lazy-load the translation pipeline for a given language code."""
-    if lang_code in _pipelines:
-        return _pipelines[lang_code]
-
-    import torch
-    from transformers import pipeline as hf_pipeline
-
-    model_id = LANGUAGE_MODELS.get(lang_code)
-    if not model_id:
-        return None
-
-    logger.info("Loading translation model '%s' for lang='%s' …", model_id, lang_code)
-    device = 0 if torch.cuda.is_available() else -1
-    pipe = hf_pipeline(
-        "translation",
-        model=model_id,
-        tokenizer=model_id,
-        framework="pt",
-        device=device,
-    )
-    _pipelines[lang_code] = pipe
-    logger.info("Translation model for '%s' loaded successfully.", lang_code)
-    return pipe
+    return get_translation_pipeline(lang_code)
 
 
 def preload(default_langs: tuple[str, ...] = ("hi", "ta")) -> None:
-    """Preload common translation models during app startup for zero first-request latency."""
-    logger.info("Preloading translation pipelines for %s …", default_langs)
-    for lang in default_langs:
-        try:
-            _get_pipeline(lang)
-        except Exception as exc:
-            logger.warning("Could not preload translation pipeline for lang='%s': %s", lang, exc)
+    """No-op for zero startup memory overhead. Pipelines load on demand via get_translation_pipeline()."""
+    pass
 
 
 def _translate_with_llm(text: str, target_lang: str) -> str:

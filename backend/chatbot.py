@@ -75,50 +75,82 @@ STRICT RULES:
 """
 
 
+import threading
+
 # ---------------------------------------------------------------------------
-# Startup loader
+# Lazy Loaders & Thread Locks
 # ---------------------------------------------------------------------------
+_llm_lock = threading.Lock()
+_system_prompt_lock = threading.Lock()
+_cached_system_prompt: str | None = None
+
+
+def get_system_prompt() -> str:
+    """Read system_prompt.txt on first request and cache string (thread-safe)."""
+    global _cached_system_prompt
+    if _cached_system_prompt is None:
+        with _system_prompt_lock:
+            if _cached_system_prompt is None:
+                prompt_path = Path(__file__).parent / "models" / "system_prompt.txt"
+                if prompt_path.exists():
+                    try:
+                        _cached_system_prompt = prompt_path.read_text(encoding="utf-8").strip()
+                    except Exception as exc:
+                        logger.warning("Error reading system_prompt.txt: %s", exc)
+                        _cached_system_prompt = SYSTEM_PROMPT.strip()
+                else:
+                    _cached_system_prompt = SYSTEM_PROMPT.strip()
+    return _cached_system_prompt
+
+
+def get_llm():
+    """Lazy-load LLM model and tokenizer thread-safely."""
+    global _backend, _model, _tokenizer, _executor
+    if _model is None:
+        with _llm_lock:
+            if _model is None:
+                if _executor is None:
+                    max_workers = min(8, (os.cpu_count() or 4))
+                    _executor = ThreadPoolExecutor(max_workers=max_workers)
+
+                import torch
+                from transformers import AutoTokenizer, AutoModelForCausalLM
+
+                logger.info("=== Loading LLM Backend ===")
+                logger.info("  Active Backend : transformers")
+                logger.info("  Model Name     : %s", PHI_HF_MODEL)
+
+                cpu_count = os.cpu_count() or 4
+                torch.set_num_threads(cpu_count)
+
+                logger.info("Loading tokenizer for '%s'...", PHI_HF_MODEL)
+                _tokenizer = AutoTokenizer.from_pretrained(
+                    PHI_HF_MODEL,
+                    trust_remote_code=True,
+                )
+                if _tokenizer.pad_token is None:
+                    _tokenizer.pad_token = _tokenizer.eos_token
+
+                torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+                device_map = "auto" if torch.cuda.is_available() else None
+
+                logger.info("Loading model weights (device_map=%s, dtype=%s)...", device_map, torch_dtype)
+                _model = AutoModelForCausalLM.from_pretrained(
+                    PHI_HF_MODEL,
+                    torch_dtype=torch_dtype,
+                    device_map=device_map,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+                )
+
+                _backend = "transformers"
+                logger.info("LLM Loaded")
+    return _model, _tokenizer
+
 
 def load() -> None:
-    """Load Hugging Face Transformers model once at startup."""
-    global _backend, _model, _tokenizer, _executor
-
-    if _executor is None:
-        max_workers = min(8, (os.cpu_count() or 4))
-        _executor = ThreadPoolExecutor(max_workers=max_workers)
-
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-
-    logger.info("=== Loading LLM Backend ===")
-    logger.info("  Active Backend : transformers")
-    logger.info("  Model Name     : %s", PHI_HF_MODEL)
-
-    cpu_count = os.cpu_count() or 4
-    torch.set_num_threads(cpu_count)
-
-    logger.info("Loading tokenizer for '%s'...", PHI_HF_MODEL)
-    _tokenizer = AutoTokenizer.from_pretrained(
-        PHI_HF_MODEL,
-        trust_remote_code=True,
-    )
-    if _tokenizer.pad_token is None:
-        _tokenizer.pad_token = _tokenizer.eos_token
-
-    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    device_map = "auto" if torch.cuda.is_available() else None
-
-    logger.info("Loading model weights (device_map=%s, dtype=%s)...", device_map, torch_dtype)
-    _model = AutoModelForCausalLM.from_pretrained(
-        PHI_HF_MODEL,
-        torch_dtype=torch_dtype,
-        device_map=device_map,
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-    )
-
-    _backend = "transformers"
-    logger.info("Hugging Face model '%s' loaded successfully on backend '%s'.", PHI_HF_MODEL, _backend)
+    """No-op for zero startup memory overhead. Model loads on demand via get_llm()."""
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +165,7 @@ def generate(
     max_tokens: int | None = None,
 ) -> str:
     """Generate a response using the loaded Hugging Face Transformers LLM backend."""
-    if not _backend or _model is None:
-        raise RuntimeError("Chatbot not loaded. Call load() first.")
+    get_llm()
 
     parsed = _parse_request_constraints(user_message)
     if max_tokens:
@@ -281,7 +312,7 @@ def _build_messages(
     history: list[dict],
 ) -> list[dict]:
     """Build compact messages list with minimal tokens to optimize Time-To-First-Token."""
-    sys_instruction = SYSTEM_PROMPT.strip()
+    sys_instruction = get_system_prompt().strip()
     if flower_name:
         sys_instruction += f"\nActive flower context: {flower_name}."
 
@@ -815,8 +846,7 @@ def generate_stream(
     Synchronous generator that yields output tokens one by one in real-time
     using Hugging Face TextIteratorStreamer.
     """
-    if not _backend or _model is None:
-        raise RuntimeError("Chatbot not loaded. Call load() first.")
+    get_llm()
 
     cache_key = f"{user_message.strip().lower()}|{flower_name.strip().lower()}"
 

@@ -69,15 +69,7 @@ def download_classifier_models(models_dir: Path) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    t0 = time.perf_counter()
-    logger.info("=== Flower AI Classifier Service – starting up ===")
-
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, download_classifier_models, MODELS_DIR)
-    await loop.run_in_executor(None, classifier.load, MODELS_DIR)
-
-    elapsed = time.perf_counter() - t0
-    logger.info("=== Classifier ready in %.1fs. Model: '%s' ===", elapsed, classifier.get_model_name())
+    logger.info("Backend Started")
     yield
     logger.info("=== Classifier Service – shutdown ===")
 

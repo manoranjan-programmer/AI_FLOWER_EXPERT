@@ -36,11 +36,15 @@ MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB: str = os.getenv("MONGO_DB", "test")
 MONGO_COLLECTION: str = os.getenv("MONGO_COLLECTION", "Flower_Knowledge_Base")
 
+import threading
+
 # ---------------------------------------------------------------------------
-# Module state – populated by load()
+# Module state – lazy loaded on demand
 # ---------------------------------------------------------------------------
+_models_dir: Path = Path(__file__).parent / "models"
 _faiss_index = None
 _documents: list[str] = []
+_flower_docs_by_norm_name: dict[str, str] = {}
 _embeddings: Optional[np.ndarray] = None
 _embed_model = None          # SentenceTransformer instance
 _flower_lookup: dict[str, dict] = {}
@@ -49,94 +53,109 @@ _mongo_client: Optional[pymongo.MongoClient] = None
 _mongo_coll = None
 _mongo_history_coll = None
 
+_faiss_lock = threading.Lock()
+_embedding_lock = threading.Lock()
+_docs_lock = threading.Lock()
+_lookup_lock = threading.Lock()
+
+
+def normalize_flower_name(name: str) -> str:
+    """Strictly normalize flower names: lowercase, trim, strip spaces, hyphens, and underscores."""
+    if not name:
+        return ""
+    return name.strip().lower().replace("-", "").replace(" ", "").replace("_", "")
+
+
+def get_faiss_index():
+    """Lazy-load FAISS index thread-safely."""
+    global _faiss_index
+    if _faiss_index is None:
+        with _faiss_lock:
+            if _faiss_index is None:
+                import faiss
+                index_path = _models_dir / "flower_faiss.index"
+                if index_path.exists():
+                    _faiss_index = faiss.read_index(str(index_path))
+                    logger.info("FAISS Loaded")
+    return _faiss_index
+
+
+def get_embedding_model():
+    """Lazy-load SentenceTransformer embedding model thread-safely."""
+    global _embed_model
+    if _embed_model is None:
+        with _embedding_lock:
+            if _embed_model is None:
+                from sentence_transformers import SentenceTransformer
+                model_name = "BAAI/bge-small-en-v1.5"
+                _embed_model = SentenceTransformer(model_name)
+                logger.info("Embedding Loaded")
+    return _embed_model
+
+
+def get_flower_documents() -> list[str]:
+    """Lazy-load flower documents JSON thread-safely."""
+    global _documents, _flower_docs_by_norm_name
+    if not _documents:
+        with _docs_lock:
+            if not _documents:
+                docs_path = _models_dir / "flower_documents.json"
+                if docs_path.exists():
+                    with open(docs_path, "r", encoding="utf-8") as f:
+                        _documents = json.load(f)
+                    for doc in _documents:
+                        m = re.search(r"Flower\s*Name:\s*([^\n]+)", doc, re.IGNORECASE)
+                        if m:
+                            raw_name = m.group(1).strip()
+                            _flower_docs_by_norm_name[normalize_flower_name(raw_name)] = doc
+                    logger.info("Flower Documents Loaded")
+    return _documents
+
+
+def get_flower_lookup() -> dict[str, dict]:
+    """Lazy-load flower lookup JSON thread-safely."""
+    global _flower_lookup, _norm_flower_map
+    if not _flower_lookup:
+        with _lookup_lock:
+            if not _flower_lookup:
+                lookup_path = _models_dir / "flower_lookup.json"
+                if lookup_path.exists():
+                    with open(lookup_path, "r", encoding="utf-8") as f:
+                        _flower_lookup = json.load(f)
+                    _norm_flower_map = {
+                        name.lower(): name
+                        for name in _flower_lookup.keys()
+                    }
+    return _flower_lookup
+
 
 def load(models_dir: Path) -> None:
-    """Load all knowledge-base artefacts and initialize MongoDB pymongo connection."""
-    global _faiss_index, _documents, _embeddings, _embed_model, _flower_lookup, _norm_flower_map, _mongo_client, _mongo_coll, _mongo_history_coll
+    """Initialize models directory and MongoDB connection. Heavy models load lazily on demand."""
+    global _models_dir, _mongo_client, _mongo_coll, _mongo_history_coll
+    _models_dir = models_dir
 
-    import faiss
-    from sentence_transformers import SentenceTransformer
     from dotenv import load_dotenv
 
-    # Re-load .env to ensure fresh credentials and DB/collection settings
     load_dotenv(models_dir.parent / ".env", override=True)
 
-    # ---- MongoDB retrieval layer via pymongo --------------------------------
     mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
     mongo_db_name = os.getenv("MONGO_DB", "test")
     mongo_coll_name = os.getenv("MONGO_COLLECTION", "Flower_Knowledge_Base")
     mongo_history_coll_name = os.getenv("MONGO_HISTORY_COLLECTION", "Flower_Search_History")
 
-    try:
-        logger.info("Connecting to MongoDB at '%s' (DB: '%s', Collection: '%s') ...", mongo_uri, mongo_db_name, mongo_coll_name)
-        _mongo_client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-        db = _mongo_client[mongo_db_name]
-        _mongo_client.admin.command('ping')
-
-        # Check specified target knowledge collection
-        _mongo_coll = db[mongo_coll_name]
-        doc_count = 0
+    if pymongo is not None:
         try:
+            logger.info("Connecting to MongoDB Atlas (db: '%s') …", mongo_db_name)
+            _mongo_client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+            db = _mongo_client[mongo_db_name]
+            _mongo_coll = db[mongo_coll_name]
+            _mongo_history_coll = db[mongo_history_coll_name]
             doc_count = _mongo_coll.count_documents({})
-        except Exception:
-            doc_count = 0
-
-        # Auto-discover non-empty collection if target collection is empty or missing
-        if doc_count == 0:
-            available_colls = db.list_collection_names()
-            logger.info("Target collection '%s' has 0 docs. Checking available collections in '%s': %s", mongo_coll_name, mongo_db_name, available_colls)
-            for coll in available_colls:
-                c = db[coll]
-                c_cnt = c.count_documents({})
-                if c_cnt > 0:
-                    _mongo_coll = c
-                    mongo_coll_name = coll
-                    doc_count = c_cnt
-                    logger.info("Auto-connected to collection '%s' with %d documents.", coll, doc_count)
-                    break
-
-        # Initialize search history collection in MongoDB Atlas
-        _mongo_history_coll = db[mongo_history_coll_name]
-        logger.info("Connected to MongoDB successfully. DB: '%s', Knowledge Collection: '%s' (%d docs), Search History Collection: '%s'.", mongo_db_name, mongo_coll_name, doc_count, mongo_history_coll_name)
-    except Exception as exc:
-        logger.warning("MongoDB connection warning (%s). Local lookup fallback enabled.", exc)
-
-    # ---- FAISS index -------------------------------------------------------
-    index_path = models_dir / "flower_faiss.index"
-    if index_path.exists():
-        logger.info("Loading FAISS index from %s …", index_path)
-        _faiss_index = faiss.read_index(str(index_path))
-        logger.info("FAISS index loaded. Total vectors: %d", _faiss_index.ntotal)
-
-    # ---- Documents ---------------------------------------------------------
-    docs_path = models_dir / "flower_documents.json"
-    if docs_path.exists():
-        with open(docs_path, "r", encoding="utf-8") as f:
-            _documents = json.load(f)
-        logger.info("Loaded %d flower documents.", len(_documents))
-
-    # ---- Embeddings (optional) ---------------------------------------------
-    emb_path = models_dir / "flower_embeddings.npy"
-    if emb_path.exists():
-        _embeddings = np.load(str(emb_path))
-        logger.info("Embeddings loaded: shape %s", _embeddings.shape)
-
-    # ---- Flower lookup (fallback cache) ------------------------------------
-    lookup_path = models_dir / "flower_lookup.json"
-    if lookup_path.exists():
-        with open(lookup_path, "r", encoding="utf-8") as f:
-            _flower_lookup = json.load(f)
-        _norm_flower_map = {
-            name.lower(): name
-            for name in _flower_lookup.keys()
-        }
-        logger.info("Loaded %d fallback flower lookup entries.", len(_flower_lookup))
-
-    # ---- Sentence transformer ----------------------------------------------
-    model_name = "BAAI/bge-small-en-v1.5"
-    logger.info("Loading SentenceTransformer (%s) …", model_name)
-    _embed_model = SentenceTransformer(model_name)
-    logger.info("SentenceTransformer ready.")
+            logger.info("Connected to MongoDB collection '%s' (%d docs). Search History Collection: '%s'.", mongo_coll_name, doc_count, mongo_history_coll_name)
+        except Exception as exc:
+            logger.warning("MongoDB connection warning: %s", exc)
+            _mongo_coll = None
+            _mongo_history_coll = None
 
 
 # ---------------------------------------------------------------------------
@@ -168,17 +187,18 @@ def _get_flower_info_cached(key: str) -> str:
         except Exception as exc:
             logger.warning("MongoDB query failed for '%s': %s", key, exc)
 
+    lookup = get_flower_lookup()
     lower_key = key.lower()
-    if lower_key in _flower_lookup:
-        return json.dumps(_flower_lookup[lower_key])
+    if lower_key in lookup:
+        return json.dumps(lookup[lower_key])
 
     normalized = _norm_flower_map.get(lower_key)
-    if normalized:
-        return json.dumps(_flower_lookup[normalized])
+    if normalized and normalized in lookup:
+        return json.dumps(lookup[normalized])
 
     for candidate, normalized_name in _norm_flower_map.items():
-        if candidate in lower_key or lower_key in candidate:
-            return json.dumps(_flower_lookup[normalized_name])
+        if (candidate in lower_key or lower_key in candidate) and normalized_name in lookup:
+            return json.dumps(lookup[normalized_name])
 
     return "{}"
 
@@ -286,27 +306,31 @@ def build_flower_context(flower_info: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _search_cached(query: str, k: int) -> tuple[str, ...]:
-    if _faiss_index is None or _embed_model is None:
+    faiss_index = get_faiss_index()
+    embed_model = get_embedding_model()
+    docs = get_flower_documents()
+
+    if faiss_index is None or embed_model is None:
         raise RuntimeError("Knowledge base has not been loaded yet.")
 
     if not query:
         return ()
 
-    query_vec = _embed_model.encode(
+    query_vec = embed_model.encode(
         [query],
         normalize_embeddings=True,
         convert_to_numpy=True
     ).astype("float32")
 
-    fetch_k = min(len(_documents), max(k * 4, 25))
-    distances, indices = _faiss_index.search(query_vec, fetch_k)
+    fetch_k = min(len(docs), max(k * 4, 25))
+    distances, indices = faiss_index.search(query_vec, fetch_k)
 
     results: list[str] = []
     seen_flowers: set[str] = set()
 
     for idx in indices[0]:
-        if 0 <= idx < len(_documents):
-            doc = _documents[idx]
+        if 0 <= idx < len(docs):
+            doc = docs[idx]
             parsed = parse_flower_doc(doc)
             flower_id = (parsed.get("Flower Name") or parsed.get("Scientific Name") or "").strip().lower()
             if not flower_id:
@@ -334,9 +358,19 @@ def search(query: str, k: int = 1) -> list[str]:
 
 def get_document(doc_idx: int) -> str:
     """Return full document by index."""
-    if 0 <= doc_idx < len(_documents):
-        return _documents[doc_idx]
+    docs = get_flower_documents()
+    if 0 <= doc_idx < len(docs):
+        return docs[doc_idx]
     return ""
+
+
+def get_flower_doc(flower_name: str) -> Optional[str]:
+    """Return exact flower document by flower_name in O(1) time using normalized string matching."""
+    if not flower_name:
+        return None
+    get_flower_documents()
+    norm_key = normalize_flower_name(flower_name)
+    return _flower_docs_by_norm_name.get(norm_key)
 
 
 def get_flower_summary(doc_idx: int, flower_name: str = "") -> dict:

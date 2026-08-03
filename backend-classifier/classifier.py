@@ -234,8 +234,20 @@ def load(models_dir: Path | None = None):
     logger.info("=== ONNX Classifier Model Loaded: '%s' (Input size: %dx%d) ===", _loaded_model_name, IMG_SIZE, IMG_SIZE)
 
 
-def get_model_name() -> str:
-    return _loaded_model_name
+import threading
+
+_classifier_lock = threading.Lock()
+_models_dir: Path | None = None
+
+
+def get_classifier():
+    """Lazy-load ONNX classifier model thread-safely."""
+    global _session
+    if _session is None:
+        with _classifier_lock:
+            if _session is None:
+                load(_models_dir)
+    return _session
 
 
 def predict(image_bytes: bytes) -> Tuple[str, float, int]:
@@ -243,8 +255,7 @@ def predict(image_bytes: bytes) -> Tuple[str, float, int]:
     Classify raw image bytes.
     Returns: (flower_name, confidence_percent, class_id)
     """
-    if _session is None:
-        raise RuntimeError("Classifier model has not been loaded yet.")
+    get_classifier()
 
     import io
     from PIL import Image
