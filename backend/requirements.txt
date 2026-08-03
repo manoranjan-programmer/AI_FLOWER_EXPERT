@@ -16,8 +16,9 @@ python-dotenv==1.0.1
 pydantic==2.10.3
 
 # --- Deep learning / AI ------------------------------------------
-tensorflow==2.18.0             # EfficientNet classifier
-numpy==1.26.4                  # pinned for TF compatibility
+onnxruntime                    # EfficientNet ONNX classifier runtime
+onnx                           # ONNX model utilities
+numpy==1.26.4                  # pinned numpy
 Pillow==11.0.0                 # image preprocessing helper
 
 # --- FAISS + embeddings ------------------------------------------
@@ -39,5 +40,3 @@ huggingface_hub>=0.20.0        # HuggingFace repository sync
 pymongo==4.17.0                # MongoDB retrieval driver
 pyjwt>=2.8.0                   # JWT token encoding & decoding
 google-auth>=2.27.0            # Google OAuth 2.0 token verification
-
-

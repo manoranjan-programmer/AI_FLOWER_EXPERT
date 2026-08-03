@@ -1,12 +1,13 @@
 """
 classifier.py
-EfficientNet Keras classifier – optimised for fast startup.
+EfficientNet ONNX classifier – optimised for fast startup and lightweight CPU inference.
 
-Speed improvements over the original:
-  - TF_CPP_MIN_LOG_LEVEL=3 silences verbose TF/XLA startup noise
-  - os.environ["CUDA_VISIBLE_DEVICES"] = "-1" forces CPU-only (no CUDA init delay)
-  - Model is warmed up with a dummy image so the first real request is instant
-  - numpy pre-allocated buffer reused across calls
+Features:
+  - Powered by ONNX Runtime (`onnxruntime`)
+  - Automatic download & caching from Hugging Face repository
+  - Model loaded ONLY ONCE during FastAPI application startup
+  - Automatic input size & channel ordering (NHWC vs NCHW) detection
+  - Identical prediction API return signature: (flower_name, confidence, doc_index)
 """
 
 from __future__ import annotations
@@ -17,26 +18,16 @@ import os
 from pathlib import Path
 from typing import Tuple
 
-# ==============================
-# TensorFlow Environment
-# ==============================
-
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
-
-_cpu_count = os.cpu_count() or 4
-os.environ.setdefault("TF_NUM_INTRAOP_THREADS", str(_cpu_count))
-os.environ.setdefault("TF_NUM_INTEROP_THREADS", "2")
-
 import numpy as np
+import onnxruntime as ort
 
 logger = logging.getLogger(__name__)
 
-_tf = None
-_model = None
+_session: ort.InferenceSession | None = None
+_input_name: str | None = None
+_output_name: str | None = None
+_is_channels_first: bool = False
 _loaded_model_name: str = "None"
-preprocess_input = None
 
 _flower_names: list[str] = []
 _idx_to_label: dict[int, str] = {}
@@ -47,30 +38,15 @@ _label_to_doc_idx: dict[str, int] = {}
 IMG_SIZE = int(os.getenv("CLASSIFIER_IMG_SIZE", "224"))
 
 
-# ==========================================
-# Import TensorFlow only once
-# ==========================================
-
-def _import_tf():
-    global _tf, preprocess_input
-
-    if _tf is None:
-        import tensorflow as tf
-        from tensorflow.keras.applications.efficientnet import preprocess_input as eff_preprocess
-
-        tf.get_logger().setLevel("ERROR")
-        tf.config.set_visible_devices([], "GPU")
-
-        _tf = tf
-        preprocess_input = eff_preprocess
-
-        logger.info("TensorFlow %s Loaded", tf.__version__)
-
-    return _tf
+def preprocess_input(x: np.ndarray) -> np.ndarray:
+    """EfficientNet preprocess_input is a documented pass-through.
+    The model internally rescales [0, 255] float input.
+    """
+    return x
 
 
 # ==========================================
-# Load Model
+# Download / Resolve model file
 # ==========================================
 
 def _resolve_file_path(filename: str, hf_repo_id: str, models_dir: Path | None = None) -> Path:
@@ -98,19 +74,22 @@ def _resolve_file_path(filename: str, hf_repo_id: str, models_dir: Path | None =
     return Path(filename)
 
 
+# ==========================================
+# Load Model
+# ==========================================
+
 def load(models_dir: Path | None = None):
 
-    global _model
-    global _idx_to_label
-    global _flower_names
-    global _label_to_flower_name
-    global _flower_name_to_doc_idx
-    global _label_to_doc_idx
-
-    tf = _import_tf()
+    global _session, _input_name, _output_name, _is_channels_first
+    global _idx_to_label, _flower_names, _label_to_flower_name
+    global _flower_name_to_doc_idx, _label_to_doc_idx
+    global IMG_SIZE, _loaded_model_name
 
     hf_repo_id = os.getenv("HF_REPO_ID", "").strip()
-    env_model_name = os.getenv("CLASSIFIER_MODEL_NAME", "flower_classifier.keras").strip() or "flower_classifier.keras"
+    env_model_name = (
+        os.getenv("CLASSIFIER_MODEL_NAME", "flower_classifier.onnx").strip()
+        or "flower_classifier.onnx"
+    )
 
     model_path = _resolve_file_path(env_model_name, hf_repo_id, models_dir)
     mapping_path = _resolve_file_path("class_mapping.json", hf_repo_id, models_dir)
@@ -218,57 +197,62 @@ def load(models_dir: Path | None = None):
             _label_to_doc_idx[label_str] = int(label_str) - 1 if label_str.isdigit() else -1
 
     # -------------------------
-    # Load Model
+    # Load ONNX Model
     # -------------------------
 
     import time
     t_start = time.perf_counter()
-    logger.info("Loading Classifier model '%s' weights into memory (please wait ~5-10s)...", model_path.name)
+    logger.info("Loading ONNX Classifier model '%s' into memory...", model_path.name)
 
-    _model = tf.keras.models.load_model(
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = os.cpu_count() or 4
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    _session = ort.InferenceSession(
         str(model_path),
-        compile=False
+        sess_options=opts,
+        providers=["CPUExecutionProvider"]
     )
+
+    _input_meta = _session.get_inputs()[0]
+    _input_name = _input_meta.name
+    _output_name = _session.get_outputs()[0].name
 
     t_elapsed = time.perf_counter() - t_start
-    logger.info("Classifier model '%s' loaded into memory in %.2fs.", model_path.name, t_elapsed)
+    logger.info("ONNX Classifier model '%s' loaded into memory in %.2fs.", model_path.name, t_elapsed)
 
-    # Auto-detect model input shape if present
-    global IMG_SIZE
+    # Auto-detect input shape and channel ordering (NHWC vs NCHW)
+    shape = _input_meta.shape
     try:
-        shape = _model.input_shape
-        if isinstance(shape, list):
-            shape = shape[0]
-        if len(shape) == 4 and shape[1] is not None and shape[2] is not None:
-            detected_size = int(shape[1])
-            if detected_size != IMG_SIZE:
-                logger.info(
-                    "Auto-detected model input size %dx%d (overriding default IMG_SIZE %d)",
-                    detected_size,
-                    int(shape[2]),
-                    IMG_SIZE,
-                )
-                IMG_SIZE = detected_size
+        if len(shape) == 4:
+            if shape[1] == 3:
+                _is_channels_first = True
+                if isinstance(shape[2], int) and shape[2] > 0:
+                    IMG_SIZE = shape[2]
+            elif shape[3] == 3 or shape[-1] == 3:
+                _is_channels_first = False
+                if isinstance(shape[1], int) and shape[1] > 0:
+                    IMG_SIZE = shape[1]
+            elif isinstance(shape[1], int) and isinstance(shape[2], int):
+                IMG_SIZE = shape[1]
     except Exception as exc:
-        logger.warning("Could not auto-detect model input shape: %s", exc)
+        logger.warning("Could not auto-detect ONNX model input shape: %s", exc)
 
-    # Warmup
-
-    dummy = np.zeros(
-        (1, IMG_SIZE, IMG_SIZE, 3),
-        dtype=np.float32
-    )
-
+    # Warmup with dummy input
+    dummy = np.zeros((1, IMG_SIZE, IMG_SIZE, 3), dtype=np.float32)
     dummy = preprocess_input(dummy)
+    if _is_channels_first:
+        dummy_in = np.transpose(dummy, (0, 3, 1, 2))
+    else:
+        dummy_in = dummy
     try:
-        _model(dummy, training=False).numpy()
+        _session.run([_output_name], {_input_name: dummy_in})
     except Exception:
         pass
 
-    global _loaded_model_name
     _loaded_model_name = model_path.name
-
-    logger.info("=== Classifier Model Loaded: '%s' (Input size: %dx%d) ===", _loaded_model_name, IMG_SIZE, IMG_SIZE)
+    logger.info("=== ONNX Classifier Model Loaded: '%s' (Input size: %dx%d) ===", _loaded_model_name, IMG_SIZE, IMG_SIZE)
 
 
 def get_model_name() -> str:
@@ -289,9 +273,7 @@ def predict(image_bytes: bytes) -> Tuple[str, float, int]:
     (flower_name, confidence_percent, doc_index)
     """
 
-    _import_tf()
-
-    if _model is None:
+    if _session is None:
         raise RuntimeError("Classifier model has not been loaded yet.")
 
     import io
@@ -301,14 +283,20 @@ def predict(image_bytes: bytes) -> Tuple[str, float, int]:
     pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     pil_img = pil_img.resize((IMG_SIZE, IMG_SIZE), Image.Resampling.BILINEAR)
 
-    # Fast numpy conversion and batch expansion (avoids Keras img_to_array overhead)
+    # Fast numpy conversion and batch expansion
     img_array = np.asarray(pil_img, dtype=np.float32)[np.newaxis, ...]
 
     # EfficientNet preprocessing
     img_array = preprocess_input(img_array)
 
-    # Fast direct model execution
-    preds = _model(img_array, training=False).numpy()
+    if _is_channels_first:
+        img_input = np.transpose(img_array, (0, 3, 1, 2))
+    else:
+        img_input = img_array
+
+    # Fast direct ONNX model execution
+    raw_outputs = _session.run([_output_name], {_input_name: img_input})
+    preds = raw_outputs[0]
 
     pred = preds[0]
     dense_idx = int(np.argmax(pred))
@@ -317,7 +305,7 @@ def predict(image_bytes: bytes) -> Tuple[str, float, int]:
     # Folder number (1-102)
     label_str = _idx_to_label.get(dense_idx, "1")
 
-    # Top-5 debug only at DEBUG level to avoid extra runtime noise.
+    # Top-5 debug logging if enabled
     if logger.isEnabledFor(logging.DEBUG):
         top5 = np.argsort(pred)[-5:][::-1]
         logger.debug("Top 5 predictions:")
@@ -350,7 +338,7 @@ def predict(image_bytes: bytes) -> Tuple[str, float, int]:
     logger.info(
         "Prediction: %s (%.2f%%)",
         flower_name,
-        confidence
+        confidence,
     )
 
     return flower_name, confidence, doc_idx

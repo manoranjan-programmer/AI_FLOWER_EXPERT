@@ -131,7 +131,7 @@ def download_models(models_dir: Path) -> None:
 
     except Exception as exc:
         logger.error("Failed to download model files from Hugging Face repo '%s': %s", hf_repo_id, exc)
-        classifier_model_name = os.getenv("CLASSIFIER_MODEL_NAME", "flower_classifier.keras").strip()
+        classifier_model_name = os.getenv("CLASSIFIER_MODEL_NAME", "flower_classifier.onnx").strip()
         critical_files = [
             classifier_model_name,
             "class_mapping.json",
