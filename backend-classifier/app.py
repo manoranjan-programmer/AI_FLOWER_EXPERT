@@ -35,53 +35,13 @@ logger = logging.getLogger(__name__)
 
 import classifier
 
-MODELS_DIR = BASE_DIR / "models"
-
-
-def download_classifier_models(models_dir: Path) -> None:
-    """Sync ONNX classifier model and mapping JSON files from Hugging Face if missing."""
-    hf_repo_id = os.getenv("HF_REPO_ID", "manoranjan-programmer/flower-ai-model").strip()
-    if not hf_repo_id:
-        logger.info("HF_REPO_ID is not set in environment. Skipping Hugging Face download.")
-        return
-
-    models_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("Checking public Hugging Face repo '%s' for classifier files...", hf_repo_id)
-
-    classifier_model = os.getenv("CLASSIFIER_MODEL_NAME", "flower_classifier.onnx").strip()
-    required_files = [
-        classifier_model,
-        "class_mapping.json",
-        "class_names.json",
-        "class_to_flower.json",
-        "flower_documents.json",
-        "flower_embeddings.npy",
-        "flower_faiss.index",
-        "flower_lookup.json",
-        "flower_training_data.json",
-    ]
-
-    try:
-        from huggingface_hub import hf_hub_download
-        for fname in required_files:
-            target = models_dir / fname
-            if not target.exists() or target.stat().st_size == 0:
-                logger.info("Downloading '%s' from HF repo '%s'...", fname, hf_repo_id)
-                try:
-                    hf_hub_download(repo_id=hf_repo_id, filename=fname, local_dir=models_dir)
-                except Exception as exc:
-                    logger.warning("Could not fetch '%s' from HF: %s", fname, exc)
-            else:
-                logger.info("Local classifier file exists: %s", fname)
-    except Exception as exc:
-        logger.error("Hugging Face model sync failed: %s", exc)
-
+# ---------------------------------------------------------------------------
+# Lifespan – lightweight startup (<200MB RAM)
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Backend Started")
-    download_classifier_models(MODELS_DIR)
-    classifier.load(MODELS_DIR)
+    logger.info("Classifier Service Started")
     yield
     logger.info("=== Classifier Service – shutdown ===")
 

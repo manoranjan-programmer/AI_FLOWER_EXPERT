@@ -63,96 +63,20 @@ import auth
 import analytics
 from conversation import conversation_manager
 
-BASE_DIR   = Path(__file__).parent
-MODELS_DIR = BASE_DIR / "models"
+BASE_DIR = Path(__file__).parent
 
 
 # ---------------------------------------------------------------------------
-# Hugging Face Public Model Downloader
-# ---------------------------------------------------------------------------
-
-def download_models(models_dir: Path) -> None:
-    """
-    Checks the public Hugging Face repository specified in HF_REPO_ID (.env)
-    and downloads any missing model files into models_dir.
-    Files that already exist locally are not re-downloaded.
-    Does not require or use HF_TOKEN since the repository is public.
-    """
-    hf_repo_id = os.getenv("HF_REPO_ID", "").strip()
-    if not hf_repo_id:
-        logger.info("HF_REPO_ID is not set in environment (.env). Skipping Hugging Face model download.")
-        return
-
-    models_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("Checking public Hugging Face repo '%s' for missing files...", hf_repo_id)
-
-    try:
-        from huggingface_hub import HfApi, hf_hub_download
-
-        api = HfApi()
-        repo_files = api.list_repo_files(repo_id=hf_repo_id)
-
-        files_to_check = [
-            f for f in repo_files
-            if not f.startswith(".git") and f not in (".gitattributes", "README.md", "LICENSE", ".gitignore")
-        ]
-
-        if not files_to_check:
-            logger.info("No model files found to sync in HF repository '%s'.", hf_repo_id)
-            return
-
-        downloaded_count = 0
-        skipped_count = 0
-
-        for file_name in files_to_check:
-            target_path = models_dir / file_name
-
-            if target_path.exists() and target_path.is_file() and target_path.stat().st_size > 0:
-                logger.info("Local file exists, skipping download: %s", file_name)
-                skipped_count += 1
-                continue
-
-            logger.info("Downloading missing file '%s' from public HF repo '%s'...", file_name, hf_repo_id)
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-
-            hf_hub_download(
-                repo_id=hf_repo_id,
-                filename=file_name,
-                local_dir=models_dir,
-            )
-            logger.info("Successfully downloaded '%s' into %s", file_name, models_dir)
-            downloaded_count += 1
-
-        logger.info(
-            "Hugging Face model sync completed. Downloaded: %d, Already existing: %d",
-            downloaded_count,
-            skipped_count,
-        )
-
-    except Exception as exc:
-        logger.error("Failed to download model files from Hugging Face repo '%s': %s", hf_repo_id, exc)
-        classifier_model_name = os.getenv("CLASSIFIER_MODEL_NAME", "flower_classifier.onnx").strip()
-        critical_files = [
-            classifier_model_name,
-            "class_mapping.json",
-            "flower_documents.json",
-        ]
-        missing_critical = [f for f in critical_files if not (models_dir / f).exists()]
-        if missing_critical:
-            raise RuntimeError(
-                f"Missing critical model files {missing_critical} and Hugging Face download failed: {exc}"
-            ) from exc
-        logger.warning("Download error occurred, but existing local model files are present. Continuing startup.")
-
-
-# ---------------------------------------------------------------------------
-# Lifespan – parallel loading for maximum speed
+# Lifespan – lightweight startup (<200MB RAM)
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Backend Started")
-    knowledge.load(MODELS_DIR)
+    try:
+        knowledge.load()
+    except Exception as exc:
+        logger.warning("MongoDB connection setup on startup: %s", exc)
     yield
     logger.info("=== Flower AI Expert – shutdown ===")
 

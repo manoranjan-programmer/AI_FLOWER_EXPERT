@@ -73,8 +73,35 @@ def normalize_flower_name(name: str) -> str:
 # Individual lazy getters (load once, cache forever, log once)
 # ---------------------------------------------------------------------------
 
+import gc
+from huggingface_hub import hf_hub_download
+
+
+def _get_hf_file(filename: str, repo_id: str | None = None) -> Path:
+    """Fetch file path directly from Hugging Face hub cache (cache_dir=None).
+    Does NOT copy or save files into local backend/models folder.
+    Falls back to local file if present in project.
+    """
+    repo = repo_id or os.getenv("HF_REPO_ID", "manoranjan-programmer/flower-ai-model").strip()
+
+    base_dir = Path(__file__).parent
+    for candidate_dir in [base_dir / "knowledge", base_dir / "models", base_dir]:
+        cand = candidate_dir / filename
+        if cand.exists() and cand.is_file():
+            return cand
+
+    if repo:
+        try:
+            downloaded = hf_hub_download(repo_id=repo, filename=filename, local_files_only=False)
+            return Path(downloaded)
+        except Exception as exc:
+            logger.warning("Hugging Face download failed for '%s' from repo '%s': %s", filename, repo, exc)
+
+    return Path(filename)
+
+
 def get_flower_documents() -> list[str]:
-    """Lazy-load flower documents thread-safely from local file or MongoDB Atlas."""
+    """Lazy-load flower documents thread-safely from HF hub cache or MongoDB Atlas."""
     global _documents, _flower_docs_by_norm_name
     if _documents:
         return _documents
@@ -82,9 +109,9 @@ def get_flower_documents() -> list[str]:
         if _documents:
             return _documents
 
-        docs_path = _models_dir / "flower_documents.json"
+        docs_path = _get_hf_file("flower_documents.json")
         if docs_path.exists():
-            logger.info("Loading Flower Documents from local JSON file...")
+            logger.info("Loading Flower Documents from '%s'...", docs_path.name)
             try:
                 with open(docs_path, "r", encoding="utf-8") as f:
                     _documents = json.load(f)
@@ -94,11 +121,12 @@ def get_flower_documents() -> list[str]:
                         raw_name = m.group(1).strip()
                         _flower_docs_by_norm_name[normalize_flower_name(raw_name)] = doc
                 logger.info("Flower Documents Loaded from file (%d documents)", len(_documents))
+                gc.collect()
                 return _documents
             except Exception as exc:
                 logger.warning("Error reading flower_documents.json: %s", exc)
 
-        logger.info("flower_documents.json not found at %s. Attempting to load from MongoDB Atlas...", docs_path)
+        logger.info("flower_documents.json not found locally/cache. Attempting to load from MongoDB Atlas...")
         _ensure_mongo_connected()
         if _mongo_coll is not None:
             try:
@@ -122,13 +150,14 @@ def get_flower_documents() -> list[str]:
                     if loaded_docs:
                         _documents = loaded_docs
                         logger.info("Successfully loaded %d flower documents from MongoDB collection '%s'.", len(_documents), os.getenv("MONGO_COLLECTION", "Flower_Knowledge_Base"))
+                        gc.collect()
                         return _documents
             except Exception as exc:
                 logger.warning("Failed to fetch documents from MongoDB Atlas: %s", exc)
 
         lookup = get_flower_lookup()
         if lookup:
-            logger.info("Building flower documents from local flower_lookup.json...")
+            logger.info("Building flower documents from flower_lookup.json...")
             loaded_docs = []
             for name, data in lookup.items():
                 doc_str = build_flower_context(data)
@@ -139,6 +168,7 @@ def get_flower_documents() -> list[str]:
                 _documents = loaded_docs
                 logger.info("Loaded %d flower documents from flower_lookup.json.", len(_documents))
 
+        gc.collect()
     return _documents
 
 
@@ -154,6 +184,7 @@ def get_embedding_model():
         from sentence_transformers import SentenceTransformer
         model_name = "BAAI/bge-small-en-v1.5"
         _embed_model = SentenceTransformer(model_name)
+        gc.collect()
         logger.info("Embeddings Loaded")
     return _embed_model
 
@@ -166,18 +197,19 @@ def get_faiss_index():
     with _faiss_lock:
         if _faiss_index is not None:
             return _faiss_index
-        index_path = _models_dir / "flower_faiss.index"
+        index_path = _get_hf_file("flower_faiss.index")
         if index_path.exists():
-            logger.info("Loading FAISS index from local file...")
+            logger.info("Loading FAISS index from '%s'...", index_path.name)
             try:
                 import faiss
                 _faiss_index = faiss.read_index(str(index_path))
                 logger.info("FAISS Loaded from file")
+                gc.collect()
                 return _faiss_index
             except Exception as exc:
-                logger.warning("Failed to load local flower_faiss.index: %s", exc)
+                logger.warning("Failed to load flower_faiss.index: %s", exc)
 
-        logger.info("flower_faiss.index not found on disk. Building in-memory FAISS vector index...")
+        logger.info("flower_faiss.index not found. Building in-memory FAISS vector index...")
         docs = get_flower_documents()
         embed_model = get_embedding_model()
         if docs and embed_model is not None:
@@ -189,6 +221,7 @@ def get_faiss_index():
                 idx.add(embeddings)
                 _faiss_index = idx
                 logger.info("In-memory FAISS vector index successfully created (%d vectors, dim=%d).", len(docs), dim)
+                gc.collect()
                 return _faiss_index
             except Exception as exc:
                 logger.warning("Failed to build in-memory FAISS index: %s", exc)
@@ -204,13 +237,14 @@ def get_flower_lookup() -> dict[str, dict]:
     with _lookup_lock:
         if _flower_lookup:
             return _flower_lookup
-        lookup_path = _models_dir / "flower_lookup.json"
+        lookup_path = _get_hf_file("flower_lookup.json")
         if lookup_path.exists():
             with open(lookup_path, "r", encoding="utf-8") as f:
                 _flower_lookup = json.load(f)
             for name, data in _flower_lookup.items():
                 _flower_lookup_by_norm_name[normalize_flower_name(name)] = data
                 _norm_flower_map[name.lower()] = name
+            gc.collect()
     return _flower_lookup
 
 
@@ -263,24 +297,20 @@ def get_knowledge_base() -> tuple:
     return _documents, _embed_model, _faiss_index
 
 
-def load(models_dir: Path) -> None:
-    """Initialize models directory and MongoDB connection. Heavy models load lazily on demand."""
+def load(models_dir: Path | None = None) -> None:
+    """Initialize MongoDB connection. Heavy models load lazily on demand."""
     global _models_dir, _mongo_client, _mongo_coll, _mongo_history_coll
-    _models_dir = models_dir
+    if models_dir is not None:
+        _models_dir = models_dir
 
-    from dotenv import load_dotenv
-
-    env_path = models_dir.parent / ".env"
-    if env_path.exists():
-        load_dotenv(env_path)
-
-    mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-    mongo_db_name = os.getenv("MONGO_DB", "test")
-    mongo_coll_name = os.getenv("MONGO_COLLECTION", "Flower_Knowledge_Base")
-    mongo_history_coll_name = os.getenv("MONGO_HISTORY_COLLECTION", "Flower_Search_History")
+    _ensure_mongo_connected()
 
     if pymongo is not None:
         try:
+            mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+            mongo_db_name = os.getenv("MONGO_DB", "test")
+            mongo_coll_name = os.getenv("MONGO_COLLECTION", "Flower_Knowledge_Base")
+            mongo_history_coll_name = os.getenv("MONGO_HISTORY_COLLECTION", "Flower_Search_History")
             logger.info("Connecting to MongoDB Atlas (db: '%s') …", mongo_db_name)
             _mongo_client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
             db = _mongo_client[mongo_db_name]

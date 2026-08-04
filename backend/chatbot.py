@@ -36,9 +36,7 @@ PHI_MAX_TOKENS: int  = int(os.getenv("PHI_MAX_TOKENS", "1024"))
 PHI_TEMPERATURE: float = float(os.getenv("PHI_TEMPERATURE", "0.3"))
 PHI_TOP_P: float     = float(os.getenv("PHI_TOP_P", "0.9"))
 
-# Point HuggingFace cache to local models folder so re-runs are instant
-_default_hf_home = str(Path(__file__).parent / "models" / "hf_cache")
-os.environ.setdefault("HF_HOME", _default_hf_home)
+import gc
 
 # ---------------------------------------------------------------------------
 # Module state
@@ -91,7 +89,7 @@ def get_system_prompt() -> str:
     if _cached_system_prompt is None:
         with _system_prompt_lock:
             if _cached_system_prompt is None:
-                prompt_path = Path(__file__).parent / "models" / "system_prompt.txt"
+                prompt_path = Path(__file__).parent / "knowledge" / "system_prompt.txt"
                 if prompt_path.exists():
                     try:
                         _cached_system_prompt = prompt_path.read_text(encoding="utf-8").strip()
@@ -120,7 +118,7 @@ def get_llm():
                 logger.info("  Active Backend : transformers")
                 logger.info("  Model Name     : %s", PHI_HF_MODEL)
 
-                num_threads = max(1, min(4, (os.cpu_count() or 4) - 1 if (os.cpu_count() or 4) > 2 else 2))
+                num_threads = max(1, min(2, (os.cpu_count() or 4)))
                 torch.set_num_threads(num_threads)
 
                 logger.info("Loading tokenizer for '%s'...", PHI_HF_MODEL)
@@ -144,6 +142,7 @@ def get_llm():
                 )
 
                 _backend = "transformers"
+                gc.collect()
                 logger.info("LLM Loaded")
     return _model, _tokenizer
 

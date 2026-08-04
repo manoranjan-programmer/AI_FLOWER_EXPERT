@@ -46,27 +46,31 @@ def preprocess_input(x: np.ndarray) -> np.ndarray:
 
 
 # ==========================================
-# Download / Resolve model file
+# Download / Resolve model file directly from Hugging Face Hub Cache
 # ==========================================
 
-def _resolve_file_path(filename: str, hf_repo_id: str, models_dir: Path | None = None) -> Path:
-    """Check local file existence first. Download from Hugging Face repository only if missing."""
-    if models_dir is not None:
-        local_path = models_dir / filename
-        if local_path.exists():
-            return local_path
+import gc
 
-    if hf_repo_id:
+def _get_hf_file(filename: str, repo_id: str | None = None) -> Path:
+    """Fetch file path directly from Hugging Face hub cache (cache_dir=None).
+    Does NOT copy or save files into local backend/models folder.
+    Falls back to local file if present in project.
+    """
+    repo = repo_id or os.getenv("HF_REPO_ID", "manoranjan-programmer/flower-ai-model").strip()
+
+    base_dir = Path(__file__).parent
+    for candidate_dir in [base_dir / "knowledge", base_dir / "models", base_dir]:
+        cand = candidate_dir / filename
+        if cand.exists() and cand.is_file():
+            return cand
+
+    if repo:
         try:
             from huggingface_hub import hf_hub_download
-            kwargs = {"repo_id": hf_repo_id, "filename": filename}
-            if models_dir is not None:
-                kwargs["local_dir"] = models_dir
-            downloaded = hf_hub_download(**kwargs)
-            logger.info("Fetched '%s' from Hugging Face repo '%s'", filename, hf_repo_id)
+            downloaded = hf_hub_download(repo_id=repo, filename=filename, local_files_only=False)
             return Path(downloaded)
         except Exception as exc:
-            logger.warning("Hugging Face download failed for '%s' from repo '%s': %s", filename, hf_repo_id, exc)
+            logger.warning("Hugging Face download failed for '%s' from repo '%s': %s", filename, repo, exc)
 
     return Path(filename)
 
@@ -82,16 +86,16 @@ def load(models_dir: Path | None = None):
     global _flower_name_to_doc_idx, _label_to_doc_idx
     global IMG_SIZE, _loaded_model_name
 
-    hf_repo_id = os.getenv("HF_REPO_ID", "").strip()
+    hf_repo_id = os.getenv("HF_REPO_ID", "manoranjan-programmer/flower-ai-model").strip()
     env_model_name = (
         os.getenv("CLASSIFIER_MODEL_NAME", "flower_classifier.onnx").strip()
         or "flower_classifier.onnx"
     )
 
-    model_path = _resolve_file_path(env_model_name, hf_repo_id, models_dir)
-    mapping_path = _resolve_file_path("class_mapping.json", hf_repo_id, models_dir)
-    docs_path = _resolve_file_path("flower_documents.json", hf_repo_id, models_dir)
-    class_to_flower_path = _resolve_file_path("class_to_flower.json", hf_repo_id, models_dir)
+    model_path = _get_hf_file(env_model_name, hf_repo_id)
+    mapping_path = _get_hf_file("class_mapping.json", hf_repo_id)
+    docs_path = _get_hf_file("flower_documents.json", hf_repo_id)
+    class_to_flower_path = _get_hf_file("class_to_flower.json", hf_repo_id)
 
     # -------------------------
     # Class Mapping
@@ -202,7 +206,7 @@ def load(models_dir: Path | None = None):
     logger.info("Loading ONNX Classifier model '%s' into memory...", model_path.name)
 
     opts = ort.SessionOptions()
-    opts.intra_op_num_threads = max(1, min(4, (os.cpu_count() or 4) - 1 if (os.cpu_count() or 4) > 2 else 2))
+    opts.intra_op_num_threads = 1
     opts.inter_op_num_threads = 1
     opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -251,6 +255,7 @@ def load(models_dir: Path | None = None):
         pass
 
     _loaded_model_name = model_path.name
+    gc.collect()
     logger.info("=== ONNX Classifier Model Loaded: '%s' (Input size: %dx%d) ===", _loaded_model_name, IMG_SIZE, IMG_SIZE)
 
 
@@ -262,7 +267,6 @@ def get_model_name() -> str:
 import threading
 
 _classifier_lock = threading.Lock()
-_models_dir: Path | None = Path(__file__).parent / "models"
 
 
 def get_classifier():
@@ -271,7 +275,7 @@ def get_classifier():
     if _session is None:
         with _classifier_lock:
             if _session is None:
-                load(_models_dir)
+                load()
     return _session
 
 

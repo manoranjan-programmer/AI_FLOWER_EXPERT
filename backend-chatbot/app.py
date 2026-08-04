@@ -58,49 +58,17 @@ import auth
 import analytics
 from conversation import conversation_manager
 
-MODELS_DIR = BASE_DIR / "models"
-
-
-def download_hf_repo_files(models_dir: Path) -> None:
-    """Sync knowledge base and mapping files from Hugging Face if missing."""
-    hf_repo_id = os.getenv("HF_REPO_ID", "manoranjan-programmer/flower-ai-model").strip()
-    if not hf_repo_id:
-        return
-    models_dir.mkdir(parents=True, exist_ok=True)
-    required_files = [
-        "flower_classifier.onnx",
-        "class_mapping.json",
-        "class_names.json",
-        "class_to_flower.json",
-        "flower_documents.json",
-        "flower_embeddings.npy",
-        "flower_faiss.index",
-        "flower_lookup.json",
-        "flower_training_data.json",
-    ]
-    try:
-        from huggingface_hub import hf_hub_download
-        for fname in required_files:
-            target = models_dir / fname
-            if not target.exists() or target.stat().st_size == 0:
-                logger.info("Downloading '%s' from HF repo '%s'...", fname, hf_repo_id)
-                try:
-                    hf_hub_download(repo_id=hf_repo_id, filename=fname, local_dir=models_dir)
-                except Exception as exc:
-                    logger.warning("Could not fetch '%s' from HF: %s", fname, exc)
-    except Exception as exc:
-        logger.error("Hugging Face repository sync failed: %s", exc)
-
-
 # ---------------------------------------------------------------------------
-# Lifespan – parallel loading for fast startup
+# Lifespan – lightweight startup (<200MB RAM)
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Backend Started")
-    download_hf_repo_files(MODELS_DIR)
-    knowledge.load(MODELS_DIR)
+    try:
+        knowledge.load()
+    except Exception as exc:
+        logger.warning("MongoDB connection setup on startup: %s", exc)
     yield
     logger.info("=== Chatbot Service – shutdown ===")
 
