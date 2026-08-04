@@ -1,33 +1,24 @@
 /**
  * flowerApi.js
- * Dual-endpoint Axios API client for Flower AI Expert.
- * Routes image classification calls to backend-classifier and chatbot/auth/history calls to backend-chatbot.
+ * Unified Axios & Fetch API client for Flower AI Expert.
+ * Direct connection to the original FastAPI backend (port 8000).
  */
 
 import axios from 'axios'
 
 const isDev = import.meta.env.DEV
 
-const rawChatbotUrl = import.meta.env.VITE_CHATBOT_API || import.meta.env.VITE_BACKEND_URL || import.meta.env.VITE_API_BASE_URL || ''
-const rawClassifierUrl = import.meta.env.VITE_CLASSIFIER_API || ''
+const rawBackendUrl = import.meta.env.VITE_BACKEND_URL || import.meta.env.VITE_API_BASE_URL || ''
+const BASE_URL = isDev ? '' : rawBackendUrl.replace(/\/+$/, '')
 
-const CHATBOT_BASE_URL = isDev ? '' : rawChatbotUrl.replace(/\/+$/, '')
-const CLASSIFIER_BASE_URL = isDev ? '' : rawClassifierUrl.replace(/\/+$/, '')
-
-const chatbotApi = axios.create({
-  baseURL: CHATBOT_BASE_URL,
-  timeout: 120_000,   // 2 min – LLM generation can be slow on CPU
+const backendApi = axios.create({
+  baseURL: BASE_URL,
+  timeout: 120_000,   // 2 min – LLM generation & inference on CPU
   withCredentials: true,
   headers: { 'Content-Type': 'application/json' },
 })
 
-const classifierApi = axios.create({
-  baseURL: CLASSIFIER_BASE_URL,
-  timeout: 60_000,
-  withCredentials: true,
-})
-
-// Response interceptors
+// Response interceptor for consistent error handling
 const handleResponseError = (error) => {
   const message =
     error.response?.data?.detail ||
@@ -37,12 +28,11 @@ const handleResponseError = (error) => {
   return Promise.reject(new Error(message))
 }
 
-chatbotApi.interceptors.response.use((res) => res, handleResponseError)
-classifierApi.interceptors.response.use((res) => res, handleResponseError)
+backendApi.interceptors.response.use((res) => res, handleResponseError)
 
-// Attach stored JWT token as Authorization Bearer header on every chatbot request
-// This is the fallback for production where cross-origin cookies may be blocked
-chatbotApi.interceptors.request.use((config) => {
+// Attach stored JWT token as Authorization Bearer header on every request
+// Fallback for cross-origin deployments where HTTP-only cookies are blocked
+backendApi.interceptors.request.use((config) => {
   const token = localStorage.getItem('flower_ai_token')
   if (token) {
     config.headers = config.headers || {}
@@ -52,12 +42,11 @@ chatbotApi.interceptors.request.use((config) => {
 })
 
 // --------------------------------------------------------------------------
-// Auth API methods (Chatbot microservice)
+// Auth API methods (Original FastAPI Backend)
 // --------------------------------------------------------------------------
 
 export async function loginWithGoogleApi(credential) {
-  const response = await chatbotApi.post('/auth/google', { credential })
-  // Store JWT token for Bearer header fallback (production cross-origin deployments)
+  const response = await backendApi.post('/auth/google', { credential })
   if (response.data?.token) {
     localStorage.setItem('flower_ai_token', response.data.token)
   }
@@ -65,40 +54,32 @@ export async function loginWithGoogleApi(credential) {
 }
 
 export async function fetchCurrentUserApi() {
-  const response = await chatbotApi.get('/auth/me')
+  const response = await backendApi.get('/auth/me')
   return response.data
 }
 
 export async function logoutApi() {
-  const response = await chatbotApi.post('/auth/logout')
-  // Clear stored token on logout
+  const response = await backendApi.post('/auth/logout')
   localStorage.removeItem('flower_ai_token')
   return response.data
 }
 
-function readFileAsDataUrl(file) {
-  return new Promise((resolve) => {
-    if (!file) return resolve('')
-    const reader = new FileReader()
-    reader.onload = (e) => resolve(e.target?.result || '')
-    reader.onerror = () => resolve('')
-    reader.readAsDataURL(file)
-  })
-}
+// --------------------------------------------------------------------------
+// Flower Prediction & Identification API
+// --------------------------------------------------------------------------
 
 /**
- * Upload a flower image for classification to backend-classifier (port 8001),
- * then notify backend-chatbot (port 8000) to set active context, save image preview, and fetch summary/card.
+ * Upload a flower image for classification to original FastAPI backend (port 8000).
+ * The original backend performs prediction, knowledge retrieval, and MongoDB history saving in one step.
  * @param {File} imageFile
  * @param {function} onUploadProgress – optional progress callback (pct: number)
- * @returns {Promise<{ session_id, flower, confidence, summary, card }>}
+ * @returns {Promise<{ session_id: string, flower: string, confidence: number, summary: string, card: object }>}
  */
 export async function predictFlower(imageFile, onUploadProgress) {
   const formData = new FormData()
   formData.append('file', imageFile)
 
-  // Step 1: Send image to Classifier service (port 8001)
-  const classifierResponse = await classifierApi.post('/predict', formData, {
+  const response = await backendApi.post('/predict', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
     onUploadProgress: onUploadProgress
       ? (evt) => {
@@ -108,69 +89,37 @@ export async function predictFlower(imageFile, onUploadProgress) {
       : undefined,
   })
 
-  const { flower_name, flower, confidence, session_id } = classifierResponse.data
-  const predictedFlower = flower_name || flower || 'Unknown'
-
-  // Step 2: Read base64 image preview for MongoDB history persistence
-  const imagePreview = await readFileAsDataUrl(imageFile)
-  const filename = imageFile?.name || 'flower.jpg'
-
-  // Step 3: Notify Chatbot service (port 8000) to initialize active flower context, image preview, & card
-  try {
-    const selectResponse = await chatbotApi.post('/flower/select', {
-      flower_name: predictedFlower,
-      confidence: confidence,
-      filename: filename,
-      image_preview: imagePreview,
-    })
-    return selectResponse.data
-  } catch (err) {
-    console.warn('Chatbot service context sync fallback:', err)
-    const normalizedFlower = (predictedFlower || 'flower').toLowerCase().replace(/ /g, '_')
-    return {
-      session_id: session_id || `session_${normalizedFlower}_${Date.now()}`,
-      flower: predictedFlower,
-      confidence: confidence || 98.5,
-      summary: `Identified as ${predictedFlower}`,
-      card: { flower_name: predictedFlower },
-    }
-  }
-}
-
-/**
- * Explicitly set active flower context on backend-chatbot (port 8000).
- */
-export async function selectFlowerApi(flowerName, confidence = 98.5, filename = '', imagePreview = '') {
-  try {
-    const response = await chatbotApi.post('/flower/select', {
-      flower_name: flowerName,
-      confidence: confidence,
-      filename: filename,
-      image_preview: imagePreview,
-    })
-    return response.data
-  } catch (err) {
-    console.warn('selectFlowerApi error:', err)
-    return null
-  }
-}
-
-/**
- * Send a chat message about the current flower to backend-chatbot (port 8000).
- * @param {string} message
- * @returns {Promise<{ answer: string }>}
- */
-export async function sendChatMessage(message) {
-  const response = await chatbotApi.post('/chat', { message })
   return response.data
 }
 
 /**
- * Send a chat message with real-time ChatGPT-style token streaming.
+ * Legacy flower context selection helper for UI navigation.
+ */
+export async function selectFlowerApi(flowerName, confidence = 98.5, filename = '', imagePreview = '') {
+  // Original backend tracks active flower context per session directly in /predict and /chat
+  return { status: 'ok', flower: flowerName }
+}
+
+// --------------------------------------------------------------------------
+// Chatbot & Streaming APIs
+// --------------------------------------------------------------------------
+
+/**
+ * Send a chat message about the current flower to original FastAPI backend (port 8000).
+ * @param {string} message
+ * @returns {Promise<{ answer: string }>}
+ */
+export async function sendChatMessage(message) {
+  const response = await backendApi.post('/chat', { message })
+  return response.data
+}
+
+/**
+ * Send a chat message with real-time token streaming via Server-Sent Events (SSE).
  */
 export async function streamChatMessage(message, onToken, onError, onDone) {
   try {
-    const rawHost = import.meta.env.VITE_CHATBOT_API || import.meta.env.VITE_BACKEND_URL || import.meta.env.VITE_API_BASE_URL || ''
+    const rawHost = import.meta.env.VITE_BACKEND_URL || import.meta.env.VITE_API_BASE_URL || ''
     const baseUrl = isDev ? '' : rawHost.replace(/\/+$/, '')
     const url = `${baseUrl}/chat/stream`
 
@@ -188,14 +137,14 @@ export async function streamChatMessage(message, onToken, onError, onDone) {
         body: JSON.stringify({ message }),
       })
     } catch (netErr) {
-      throw new Error('Could not connect to Chatbot Service on port 8000. Please ensure backend-chatbot is running on port 8000.')
+      throw new Error('Could not connect to FastAPI Backend on port 8000. Please ensure the original backend is running on http://localhost:8000.')
     }
 
     if (!response.ok) {
       const errText = await response.text()
       let errMsg = 'Failed to connect to streaming response.'
       if (response.status === 502 || response.status === 504) {
-        errMsg = 'Chatbot Service is offline on port 8000. Please start backend-chatbot with: uvicorn app:app --port 8000'
+        errMsg = 'FastAPI Backend is offline on port 8000. Please start backend with: uvicorn app:app --port 8000'
       } else {
         try {
           const parsed = JSON.parse(errText)
@@ -253,11 +202,15 @@ export async function streamChatMessage(message, onToken, onError, onDone) {
   }
 }
 
+// --------------------------------------------------------------------------
+// Utilities, History & Analytics
+// --------------------------------------------------------------------------
+
 /**
  * Translate text to a target language offline.
  */
 export async function translateText(text, language) {
-  const response = await chatbotApi.post('/translate', { text, language })
+  const response = await backendApi.post('/translate', { text, language })
   return response.data
 }
 
@@ -265,7 +218,7 @@ export async function translateText(text, language) {
  * Health check.
  */
 export async function healthCheck() {
-  const response = await chatbotApi.get('/health')
+  const response = await backendApi.get('/health')
   return response.data
 }
 
@@ -273,7 +226,7 @@ export async function healthCheck() {
  * Fetch search history records from MongoDB Atlas.
  */
 export async function fetchHistory() {
-  const response = await chatbotApi.get('/history')
+  const response = await backendApi.get('/history')
   return response.data
 }
 
@@ -281,7 +234,7 @@ export async function fetchHistory() {
  * Save chat session history to MongoDB Atlas.
  */
 export async function saveHistorySession(sessionData) {
-  const response = await chatbotApi.post('/history/save', sessionData)
+  const response = await backendApi.post('/history/save', sessionData)
   return response.data
 }
 
@@ -289,8 +242,8 @@ export async function saveHistorySession(sessionData) {
  * Submit structured user feedback.
  */
 export async function submitFeedbackApi(feedbackData) {
-  const response = await chatbotApi.post('/api/analytics/feedback', feedbackData)
+  const response = await backendApi.post('/api/analytics/feedback', feedbackData)
   return response.data
 }
 
-export default chatbotApi
+export default backendApi
