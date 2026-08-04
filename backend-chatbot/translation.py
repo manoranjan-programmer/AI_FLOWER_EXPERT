@@ -95,8 +95,12 @@ def _get_pipeline(lang_code: str):
 
 
 def preload(default_langs: tuple[str, ...] = ("hi", "ta")) -> None:
-    """No-op for zero startup memory overhead. Pipelines load on demand via get_translation_pipeline()."""
-    pass
+    """Preload translation pipelines for specified default languages."""
+    for lang in default_langs:
+        try:
+            get_translation_pipeline(lang)
+        except Exception as exc:
+            logger.warning("Failed to preload translation model for lang='%s': %s", lang, exc)
 
 
 def _translate_with_llm(text: str, target_lang: str) -> str:

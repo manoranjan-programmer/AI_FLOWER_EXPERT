@@ -40,7 +40,7 @@ MODELS_DIR = BASE_DIR / "models"
 
 def download_classifier_models(models_dir: Path) -> None:
     """Sync ONNX classifier model and mapping JSON files from Hugging Face if missing."""
-    hf_repo_id = os.getenv("HF_REPO_ID", "").strip()
+    hf_repo_id = os.getenv("HF_REPO_ID", "manoranjan-programmer/flower-ai-model").strip()
     if not hf_repo_id:
         logger.info("HF_REPO_ID is not set in environment. Skipping Hugging Face download.")
         return
@@ -49,7 +49,17 @@ def download_classifier_models(models_dir: Path) -> None:
     logger.info("Checking public Hugging Face repo '%s' for classifier files...", hf_repo_id)
 
     classifier_model = os.getenv("CLASSIFIER_MODEL_NAME", "flower_classifier.onnx").strip()
-    required_files = [classifier_model, "class_mapping.json", "flower_documents.json", "class_to_flower.json"]
+    required_files = [
+        classifier_model,
+        "class_mapping.json",
+        "class_names.json",
+        "class_to_flower.json",
+        "flower_documents.json",
+        "flower_embeddings.npy",
+        "flower_faiss.index",
+        "flower_lookup.json",
+        "flower_training_data.json",
+    ]
 
     try:
         from huggingface_hub import hf_hub_download
@@ -70,6 +80,8 @@ def download_classifier_models(models_dir: Path) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Backend Started")
+    download_classifier_models(MODELS_DIR)
+    classifier.load(MODELS_DIR)
     yield
     logger.info("=== Classifier Service – shutdown ===")
 
