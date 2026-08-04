@@ -277,7 +277,7 @@ def validate_flower_context(classifier_flower: str, loaded_doc: str) -> str:
     Validation middleware helper. Asserts Classifier Flower == Knowledge Flower == Prompt Flower == History Flower.
     Logs exact required verification block and throws HTTPException on mismatch.
     """
-    m = re.search(r"Flower\s*Name:\s*([^\n]+)", loaded_doc or "", re.IGNORECASE)
+    m = re.search(r"(?:Flower\s*Name|Flower|flower_name)\s*:\s*([^\n]+)", loaded_doc or "", re.IGNORECASE)
     doc_flower = m.group(1).strip() if m else classifier_flower
 
     print("--------------------------------")

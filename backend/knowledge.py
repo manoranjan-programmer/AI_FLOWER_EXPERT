@@ -73,26 +73,71 @@ def normalize_flower_name(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def get_flower_documents() -> list[str]:
-    """Lazy-load flower_documents.json thread-safely. Logs once on first load."""
+    """Lazy-load flower documents thread-safely from local file or MongoDB Atlas."""
     global _documents, _flower_docs_by_norm_name
     if _documents:
         return _documents
     with _docs_lock:
         if _documents:
             return _documents
+
         docs_path = _models_dir / "flower_documents.json"
-        if not docs_path.exists():
-            logger.error("flower_documents.json not found at %s", docs_path)
-            return _documents
-        logger.info("Loading Flower Documents...")
-        with open(docs_path, "r", encoding="utf-8") as f:
-            _documents = json.load(f)
-        for doc in _documents:
-            m = re.search(r"Flower\s*Name:\s*([^\n]+)", doc, re.IGNORECASE)
-            if m:
-                raw_name = m.group(1).strip()
-                _flower_docs_by_norm_name[normalize_flower_name(raw_name)] = doc
-        logger.info("Flower Documents Loaded (%d documents)", len(_documents))
+        if docs_path.exists():
+            logger.info("Loading Flower Documents from local JSON file...")
+            try:
+                with open(docs_path, "r", encoding="utf-8") as f:
+                    _documents = json.load(f)
+                for doc in _documents:
+                    m = re.search(r"(?:Flower\s*Name|Flower|flower_name)\s*:\s*([^\n]+)", doc, re.IGNORECASE)
+                    if m:
+                        raw_name = m.group(1).strip()
+                        _flower_docs_by_norm_name[normalize_flower_name(raw_name)] = doc
+                logger.info("Flower Documents Loaded from file (%d documents)", len(_documents))
+                return _documents
+            except Exception as exc:
+                logger.warning("Error reading flower_documents.json: %s", exc)
+
+        logger.info("flower_documents.json not found at %s. Attempting to load from MongoDB Atlas...", docs_path)
+        _ensure_mongo_connected()
+        if _mongo_coll is not None:
+            try:
+                mongo_docs = list(_mongo_coll.find({}))
+                if mongo_docs:
+                    loaded_docs = []
+                    for mdoc in mongo_docs:
+                        mdoc.pop("_id", None)
+                        fl_name = (
+                            mdoc.get("flower") or mdoc.get("Flower") or
+                            mdoc.get("flower_name") or mdoc.get("Flower Name") or
+                            mdoc.get("name") or mdoc.get("Name") or ""
+                        )
+                        doc_str = build_flower_context(mdoc)
+                        if not doc_str and fl_name:
+                            doc_str = f"Flower Name: {fl_name}\nDescription: Botanical flower species {fl_name}."
+                        if doc_str:
+                            loaded_docs.append(doc_str)
+                            if fl_name:
+                                _flower_docs_by_norm_name[normalize_flower_name(fl_name)] = doc_str
+                    if loaded_docs:
+                        _documents = loaded_docs
+                        logger.info("Successfully loaded %d flower documents from MongoDB collection '%s'.", len(_documents), os.getenv("MONGO_COLLECTION", "Flower_Knowledge_Base"))
+                        return _documents
+            except Exception as exc:
+                logger.warning("Failed to fetch documents from MongoDB Atlas: %s", exc)
+
+        lookup = get_flower_lookup()
+        if lookup:
+            logger.info("Building flower documents from local flower_lookup.json...")
+            loaded_docs = []
+            for name, data in lookup.items():
+                doc_str = build_flower_context(data)
+                if doc_str:
+                    loaded_docs.append(doc_str)
+                    _flower_docs_by_norm_name[normalize_flower_name(name)] = doc_str
+            if loaded_docs:
+                _documents = loaded_docs
+                logger.info("Loaded %d flower documents from flower_lookup.json.", len(_documents))
+
     return _documents
 
 
@@ -113,7 +158,7 @@ def get_embedding_model():
 
 
 def get_faiss_index():
-    """Lazy-load FAISS index thread-safely. Logs once."""
+    """Lazy-load FAISS index thread-safely from file, or dynamically build in-memory index from documents."""
     global _faiss_index
     if _faiss_index is not None:
         return _faiss_index
@@ -121,13 +166,32 @@ def get_faiss_index():
         if _faiss_index is not None:
             return _faiss_index
         index_path = _models_dir / "flower_faiss.index"
-        if not index_path.exists():
-            logger.error("flower_faiss.index not found at %s", index_path)
-            return None
-        logger.info("Loading FAISS...")
-        import faiss
-        _faiss_index = faiss.read_index(str(index_path))
-        logger.info("FAISS Loaded")
+        if index_path.exists():
+            logger.info("Loading FAISS index from local file...")
+            try:
+                import faiss
+                _faiss_index = faiss.read_index(str(index_path))
+                logger.info("FAISS Loaded from file")
+                return _faiss_index
+            except Exception as exc:
+                logger.warning("Failed to load local flower_faiss.index: %s", exc)
+
+        logger.info("flower_faiss.index not found on disk. Building in-memory FAISS vector index...")
+        docs = get_flower_documents()
+        embed_model = get_embedding_model()
+        if docs and embed_model is not None:
+            try:
+                import faiss
+                embeddings = embed_model.encode(docs, normalize_embeddings=True, convert_to_numpy=True).astype("float32")
+                dim = embeddings.shape[1]
+                idx = faiss.IndexFlatIP(dim)
+                idx.add(embeddings)
+                _faiss_index = idx
+                logger.info("In-memory FAISS vector index successfully created (%d vectors, dim=%d).", len(docs), dim)
+                return _faiss_index
+            except Exception as exc:
+                logger.warning("Failed to build in-memory FAISS index: %s", exc)
+
     return _faiss_index
 
 

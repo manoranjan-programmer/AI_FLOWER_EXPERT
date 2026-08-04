@@ -74,26 +74,71 @@ def normalize_flower_name(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def get_flower_documents() -> list[str]:
-    """Lazy-load flower_documents.json thread-safely. Logs once on first load."""
+    """Lazy-load flower documents thread-safely from local file or MongoDB Atlas."""
     global _documents, _flower_docs_by_norm_name
     if _documents:
         return _documents
     with _docs_lock:
         if _documents:
             return _documents
+
         docs_path = _models_dir / "flower_documents.json"
-        if not docs_path.exists():
-            logger.error("flower_documents.json not found at %s", docs_path)
-            return _documents
-        logger.info("Loading Flower Documents...")
-        with open(docs_path, "r", encoding="utf-8") as f:
-            _documents = json.load(f)
-        for doc in _documents:
-            m = re.search(r"Flower\s*Name:\s*([^\n]+)", doc, re.IGNORECASE)
-            if m:
-                raw_name = m.group(1).strip()
-                _flower_docs_by_norm_name[normalize_flower_name(raw_name)] = doc
-        logger.info("Flower Documents Loaded (%d documents)", len(_documents))
+        if docs_path.exists():
+            logger.info("Loading Flower Documents from local JSON file...")
+            try:
+                with open(docs_path, "r", encoding="utf-8") as f:
+                    _documents = json.load(f)
+                for doc in _documents:
+                    m = re.search(r"(?:Flower\s*Name|Flower|flower_name)\s*:\s*([^\n]+)", doc, re.IGNORECASE)
+                    if m:
+                        raw_name = m.group(1).strip()
+                        _flower_docs_by_norm_name[normalize_flower_name(raw_name)] = doc
+                logger.info("Flower Documents Loaded from file (%d documents)", len(_documents))
+                return _documents
+            except Exception as exc:
+                logger.warning("Error reading flower_documents.json: %s", exc)
+
+        logger.info("flower_documents.json not found at %s. Attempting to load from MongoDB Atlas...", docs_path)
+        _ensure_mongo_connected()
+        if _mongo_coll is not None:
+            try:
+                mongo_docs = list(_mongo_coll.find({}))
+                if mongo_docs:
+                    loaded_docs = []
+                    for mdoc in mongo_docs:
+                        mdoc.pop("_id", None)
+                        fl_name = (
+                            mdoc.get("flower") or mdoc.get("Flower") or
+                            mdoc.get("flower_name") or mdoc.get("Flower Name") or
+                            mdoc.get("name") or mdoc.get("Name") or ""
+                        )
+                        doc_str = build_flower_context(mdoc)
+                        if not doc_str and fl_name:
+                            doc_str = f"Flower Name: {fl_name}\nDescription: Botanical flower species {fl_name}."
+                        if doc_str:
+                            loaded_docs.append(doc_str)
+                            if fl_name:
+                                _flower_docs_by_norm_name[normalize_flower_name(fl_name)] = doc_str
+                    if loaded_docs:
+                        _documents = loaded_docs
+                        logger.info("Successfully loaded %d flower documents from MongoDB collection '%s'.", len(_documents), os.getenv("MONGO_COLLECTION", "Flower_Knowledge_Base"))
+                        return _documents
+            except Exception as exc:
+                logger.warning("Failed to fetch documents from MongoDB Atlas: %s", exc)
+
+        lookup = get_flower_lookup()
+        if lookup:
+            logger.info("Building flower documents from local flower_lookup.json...")
+            loaded_docs = []
+            for name, data in lookup.items():
+                doc_str = build_flower_context(data)
+                if doc_str:
+                    loaded_docs.append(doc_str)
+                    _flower_docs_by_norm_name[normalize_flower_name(name)] = doc_str
+            if loaded_docs:
+                _documents = loaded_docs
+                logger.info("Loaded %d flower documents from flower_lookup.json.", len(_documents))
+
     return _documents
 
 
@@ -114,7 +159,7 @@ def get_embedding_model():
 
 
 def get_faiss_index():
-    """Lazy-load FAISS index thread-safely. Logs once."""
+    """Lazy-load FAISS index thread-safely from file, or dynamically build in-memory index from documents."""
     global _faiss_index
     if _faiss_index is not None:
         return _faiss_index
@@ -122,13 +167,32 @@ def get_faiss_index():
         if _faiss_index is not None:
             return _faiss_index
         index_path = _models_dir / "flower_faiss.index"
-        if not index_path.exists():
-            logger.error("flower_faiss.index not found at %s", index_path)
-            return None
-        logger.info("Loading FAISS...")
-        import faiss
-        _faiss_index = faiss.read_index(str(index_path))
-        logger.info("FAISS Loaded")
+        if index_path.exists():
+            logger.info("Loading FAISS index from local file...")
+            try:
+                import faiss
+                _faiss_index = faiss.read_index(str(index_path))
+                logger.info("FAISS Loaded from file")
+                return _faiss_index
+            except Exception as exc:
+                logger.warning("Failed to load local flower_faiss.index: %s", exc)
+
+        logger.info("flower_faiss.index not found on disk. Building in-memory FAISS vector index...")
+        docs = get_flower_documents()
+        embed_model = get_embedding_model()
+        if docs and embed_model is not None:
+            try:
+                import faiss
+                embeddings = embed_model.encode(docs, normalize_embeddings=True, convert_to_numpy=True).astype("float32")
+                dim = embeddings.shape[1]
+                idx = faiss.IndexFlatIP(dim)
+                idx.add(embeddings)
+                _faiss_index = idx
+                logger.info("In-memory FAISS vector index successfully created (%d vectors, dim=%d).", len(docs), dim)
+                return _faiss_index
+            except Exception as exc:
+                logger.warning("Failed to build in-memory FAISS index: %s", exc)
+
     return _faiss_index
 
 
@@ -159,9 +223,9 @@ def get_knowledge_base() -> tuple:
     Dependency-aware lazy initialiser for the full knowledge stack.
 
     Load order (strict dependency chain):
-      1. Flower Documents  – needed for context
+      1. Flower Documents  – needed for context (loaded from MongoDB or file)
       2. Embedding Model   – needed for FAISS queries
-      3. FAISS Index       – needs embeddings to be ready first
+      3. FAISS Index       – loaded from file or built dynamically in memory
 
     Returns (documents, embed_model, faiss_index).
     Raises RuntimeError with a clear message if any component failed to load.
@@ -190,8 +254,7 @@ def get_knowledge_base() -> tuple:
         if missing:
             raise RuntimeError(
                 f"Knowledge base failed to load: {', '.join(missing)}. "
-                "Ensure flower_documents.json, flower_faiss.index, and "
-                "BAAI/bge-small-en-v1.5 are available."
+                "Ensure MongoDB Atlas connection and embedding models are available."
             )
 
         _kb_ready = True
@@ -253,17 +316,42 @@ def _get_flower_info_cached(key: str) -> str:
     if normalized and normalized in lookup:
         return json.dumps(lookup[normalized])
 
-    # 2. MongoDB exact query
+    # 2. MongoDB query with multiple field aliases and flexible pattern matching
+    _ensure_mongo_connected()
     if _mongo_coll is not None:
         try:
+            clean_pattern = f"^{re.escape(key)}$"
+            flex_key = key.replace("_", " ").replace("-", " ")
+            flex_pattern = f"^{re.escape(flex_key)}$"
             query = {
                 "$or": [
-                    {"Flower": re.compile(f"^{re.escape(key)}$", re.IGNORECASE)},
-                    {"flower": re.compile(f"^{re.escape(key)}$", re.IGNORECASE)},
-                    {"flower_name": re.compile(f"^{re.escape(key)}$", re.IGNORECASE)},
+                    {"Flower": re.compile(clean_pattern, re.IGNORECASE)},
+                    {"flower": re.compile(clean_pattern, re.IGNORECASE)},
+                    {"flower_name": re.compile(clean_pattern, re.IGNORECASE)},
+                    {"Flower Name": re.compile(clean_pattern, re.IGNORECASE)},
+                    {"name": re.compile(clean_pattern, re.IGNORECASE)},
+                    {"Name": re.compile(clean_pattern, re.IGNORECASE)},
+                    {"scientific_name": re.compile(clean_pattern, re.IGNORECASE)},
+                    {"Scientific Name": re.compile(clean_pattern, re.IGNORECASE)},
+                    {"Flower": re.compile(flex_pattern, re.IGNORECASE)},
+                    {"flower": re.compile(flex_pattern, re.IGNORECASE)},
+                    {"flower_name": re.compile(flex_pattern, re.IGNORECASE)},
+                    {"Flower Name": re.compile(flex_pattern, re.IGNORECASE)},
                 ]
             }
             doc = _mongo_coll.find_one(query)
+            if not doc:
+                sub_query = {
+                    "$or": [
+                        {"Flower": re.compile(re.escape(key), re.IGNORECASE)},
+                        {"flower": re.compile(re.escape(key), re.IGNORECASE)},
+                        {"flower_name": re.compile(re.escape(key), re.IGNORECASE)},
+                        {"Flower Name": re.compile(re.escape(key), re.IGNORECASE)},
+                        {"name": re.compile(re.escape(key), re.IGNORECASE)},
+                    ]
+                }
+                doc = _mongo_coll.find_one(sub_query)
+
             if doc:
                 doc.pop("_id", None)
                 normalized_doc = {}
@@ -444,12 +532,32 @@ def get_document(doc_idx: int) -> str:
 
 
 def get_flower_doc(flower_name: str) -> Optional[str]:
-    """Return exact flower document by flower_name in O(1) time using normalized string matching."""
+    """Return exact flower document by flower_name using indexed documents, MongoDB, or card generator."""
     if not flower_name:
         return None
     get_flower_documents()
     norm_key = normalize_flower_name(flower_name)
-    return _flower_docs_by_norm_name.get(norm_key)
+    cached_doc = _flower_docs_by_norm_name.get(norm_key)
+    if cached_doc:
+        return cached_doc
+
+    info = get_flower_info(flower_name)
+    if info:
+        built_doc = build_flower_context(info)
+        if built_doc:
+            _flower_docs_by_norm_name[norm_key] = built_doc
+            return built_doc
+
+    card = get_flower_summary(-1, flower_name)
+    if card and card.get("Flower Name"):
+        built_doc = build_flower_context(card)
+        if built_doc:
+            _flower_docs_by_norm_name[norm_key] = built_doc
+            return built_doc
+
+    fallback_doc = f"Flower Name: {flower_name}\nDescription: {flower_name} is a botanical species."
+    _flower_docs_by_norm_name[norm_key] = fallback_doc
+    return fallback_doc
 
 
 def get_flower_doc_by_name(flower_name: str) -> str:
@@ -538,16 +646,18 @@ def get_flower_summary(doc_idx: int, flower_name: str = "") -> dict:
 
 def _ensure_mongo_connected() -> bool:
     global _mongo_client, _mongo_coll, _mongo_history_coll
-    if _mongo_history_coll is not None:
+    if _mongo_coll is not None and _mongo_history_coll is not None:
         return True
     if pymongo is None:
         return False
     try:
         mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
         mongo_db_name = os.getenv("MONGO_DB", "test")
+        mongo_coll_name = os.getenv("MONGO_COLLECTION", "Flower_Knowledge_Base")
         mongo_history_coll_name = os.getenv("MONGO_HISTORY_COLLECTION", "Flower_Search_History")
         _mongo_client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
         db = _mongo_client[mongo_db_name]
+        _mongo_coll = db[mongo_coll_name]
         _mongo_history_coll = db[mongo_history_coll_name]
         return True
     except Exception as exc:

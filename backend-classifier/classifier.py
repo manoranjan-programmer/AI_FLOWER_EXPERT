@@ -92,8 +92,13 @@ def load(models_dir: Path | None = None):
     # -------------------------
     # Flower Documents
     # -------------------------
-    with open(docs_path, "r", encoding="utf-8") as f:
-        docs = json.load(f)
+    docs = []
+    if docs_path.exists():
+        try:
+            with open(docs_path, "r", encoding="utf-8") as f:
+                docs = json.load(f)
+        except Exception as exc:
+            logger.warning("Could not read %s: %s", docs_path, exc)
 
     def normalize_name(name: str) -> str:
         return " ".join(
@@ -125,19 +130,21 @@ def load(models_dir: Path | None = None):
         "hippeastrum": "amaryllis (hippeastrum)",
     }
 
-    for idx, doc in enumerate(docs):
-        flower = "Unknown"
-        lines = doc.splitlines()
-        for i, line in enumerate(lines):
-            if line.strip() == "Flower Name:" and i + 1 < len(lines):
-                flower = lines[i + 1].strip()
-                break
+    if docs:
+        for idx, doc in enumerate(docs):
+            flower = "Unknown"
+            lines = doc.splitlines()
+            for i, line in enumerate(lines):
+                if line.strip() == "Flower Name:" and i + 1 < len(lines):
+                    flower = lines[i + 1].strip()
+                    break
 
-        _flower_names.append(flower)
-        normalized = normalize_name(flower)
-        _flower_name_to_doc_idx[normalized] = idx
-
-    logger.info("Loaded %d Flower Documents", len(_flower_names))
+            _flower_names.append(flower)
+            normalized = normalize_name(flower)
+            _flower_name_to_doc_idx[normalized] = idx
+        logger.info("Loaded %d Flower Documents from JSON", len(_flower_names))
+    else:
+        logger.info("flower_documents.json not found; classifier fallback active.")
 
     if class_to_flower_path.exists():
         with open(class_to_flower_path, "r", encoding="utf-8") as f:
